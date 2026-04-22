@@ -22,6 +22,7 @@ from pathlib import Path
 
 import cv2
 
+from pyclashbot.utils.platform import is_macos
 from rl.action_map import CARD_SLOTS, NO_OP, TOTAL_ACTIONS, decode
 from rl.bridge import (
     SCREEN_H,
@@ -38,7 +39,16 @@ OUT = Path("smoke_test_screen.png")
 
 def main() -> int:
     print("[1/5] Constructing emulator controller...")
-    emulator = get_emulator(emulator_type="memu", render_mode="directx", debug_mode=True)
+    if is_macos():
+        # macOS: BlueStacks with Vulkan. MEmu is Windows-only.
+        emulator = get_emulator(
+            emulator_type="bluestacks",
+            render_settings={"graphics_renderer": "vlcn"},
+        )
+    else:
+        emulator = get_emulator(
+            emulator_type="memu", render_mode="directx", debug_mode=True
+        )
     print(f"      controller: {type(emulator).__name__}")
 
     print("[2/5] Taking a screenshot...")

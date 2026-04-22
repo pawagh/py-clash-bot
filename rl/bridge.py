@@ -20,7 +20,7 @@ Screen geometry is fixed at 419x633 by MEMU_CONFIGURATION in memu.py.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -38,17 +38,29 @@ from pyclashbot.bot.nav import (
     wait_for_clash_main_menu,
 )
 from pyclashbot.utils.logger import Logger
+from pyclashbot.utils.platform import is_macos
 
 if TYPE_CHECKING:
     from pyclashbot.emulators.base import BaseEmulatorController
 
 FightMode = Literal["Classic 1v1", "Classic 2v2", "Trophy Road"]
+EmulatorType = Literal["bluestacks", "memu"]
 
 SCREEN_W = 419
 SCREEN_H = 633
 
+# BlueStacks graphics_renderer codes (see bluestacks.py::_normalize_renderer).
+# On macOS you almost always want "vlcn" (Vulkan); "gl" is a fallback; "dx"
+# is Windows-only and will silently fall back to the platform default.
+DEFAULT_BLUESTACKS_RENDER: dict[str, str] = {"graphics_renderer": "vlcn"}
+
 _emulator: BaseEmulatorController | None = None
 _logger: Logger | None = None
+
+
+def _default_emulator_type() -> EmulatorType:
+    """MEmu is Windows-only; default to BlueStacks on macOS."""
+    return "bluestacks" if is_macos() else "memu"
 
 
 def get_logger() -> Logger:
@@ -64,33 +76,53 @@ def get_logger() -> Logger:
 
 
 def get_emulator(
-    emulator_type: Literal["memu", "bluestacks"] = "memu",
-    render_mode: str = "directx",
+    emulator_type: EmulatorType | None = None,
+    render_mode: str | None = None,
+    render_settings: dict[str, Any] | None = None,
     debug_mode: bool = False,
 ) -> BaseEmulatorController:
     """Lazily construct and cache the emulator controller.
 
-    debug_mode=True skips configure/restart so you can attach to an already
-    running VM for iterative development. Flip it to False when you want
-    the full supervised boot + Clash startup path.
+    Args:
+        emulator_type: "bluestacks" (macOS + Windows) or "memu" (Windows only).
+            Defaults to "bluestacks" on macOS, "memu" on Windows.
+        render_mode: MEmu-only. "directx" or "opengl". Ignored for BlueStacks.
+        render_settings: BlueStacks-only. Dict with key "graphics_renderer";
+            values "vlcn" (Vulkan, macOS default), "gl" (OpenGL), or "dx"
+            (DirectX, Windows-only). Ignored for MEmu. If omitted,
+            DEFAULT_BLUESTACKS_RENDER is used.
+        debug_mode: MEmu-only flag that skips configure/restart so you can
+            attach to an already-running VM for iterative development.
     """
     global _emulator
     if _emulator is not None:
         return _emulator
 
+    chosen = emulator_type or _default_emulator_type()
     logger = get_logger()
-    if emulator_type == "memu":
+
+    if chosen == "memu":
         from pyclashbot.emulators.memu import MemuEmulatorController
 
         _emulator = MemuEmulatorController(
-            logger, render_mode=render_mode, debug_mode=debug_mode
+            logger,
+            render_mode=render_mode or "directx",
+            debug_mode=debug_mode,
         )
-    elif emulator_type == "bluestacks":
+    elif chosen == "bluestacks":
         from pyclashbot.emulators.bluestacks import BlueStacksEmulatorController
 
-        _emulator = BlueStacksEmulatorController(logger, render_mode=render_mode)  # type: ignore[call-arg]
+        settings = render_settings or DEFAULT_BLUESTACKS_RENDER
+        if "graphics_renderer" not in settings:
+            # BlueStacks indexes this key unconditionally — fail loudly
+            # rather than letting the controller raise deep in its boot.
+            raise ValueError(
+                "render_settings must contain a 'graphics_renderer' key "
+                "(e.g. {'graphics_renderer': 'vlcn'})"
+            )
+        _emulator = BlueStacksEmulatorController(logger, render_settings=settings)
     else:
-        raise ValueError(f"Unknown emulator type: {emulator_type}")
+        raise ValueError(f"Unknown emulator type: {chosen}")
     return _emulator
 
 
