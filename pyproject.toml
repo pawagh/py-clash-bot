@@ -24,6 +24,9 @@ dependencies = [
     "pypresence>=4.3.0,<5",
     "pillow (>=11.3.0,<13.0.0)",
     "ttkbootstrap>=1.12.1,<1.21",
+    "gymnasium>=0.29",
+    "stable-baselines3>=2.3",
+    "tensorboard>=2.17",
 ]
 
 [tool.setuptools.packages.find]
