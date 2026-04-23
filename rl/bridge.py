@@ -46,6 +46,10 @@ if TYPE_CHECKING:
 FightMode = Literal["Classic 1v1", "Classic 2v2", "Trophy Road"]
 EmulatorType = Literal["bluestacks", "memu"]
 
+# Default battle mode. Trophy Road matches are typically shorter and
+# always available on any account, so it's the cheapest to train on.
+DEFAULT_MODE: FightMode = "Trophy Road"
+
 SCREEN_W = 419
 SCREEN_H = 633
 
@@ -160,7 +164,7 @@ def is_battle_over() -> bool:
     return bool(check_if_battle_has_ended(get_emulator()))
 
 
-def start_battle(mode: FightMode = "Classic 1v1", start_timeout: int = 120) -> bool:
+def start_battle(mode: FightMode = DEFAULT_MODE, start_timeout: int = 120) -> bool:
     """Navigate from the main menu to an active battle.
 
     Mirrors what fight.do_fight_state does on entry:

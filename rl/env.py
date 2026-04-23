@@ -23,6 +23,7 @@ from gymnasium import spaces
 from pyclashbot.utils.cancellation import interruptible_sleep
 from rl.action_map import CARD_SLOTS, TOTAL_ACTIONS, decode
 from rl.bridge import (
+    DEFAULT_MODE,
     SCREEN_H,
     SCREEN_W,
     FightMode,
@@ -47,7 +48,7 @@ RESET_WAIT_TIMEOUT = 120
 class ClashRoyaleEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 2}
 
-    def __init__(self, mode: FightMode = "Classic 1v1") -> None:
+    def __init__(self, mode: FightMode = DEFAULT_MODE) -> None:
         super().__init__()
         self.mode: FightMode = mode
         self.action_space = spaces.Discrete(TOTAL_ACTIONS)
