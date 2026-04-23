@@ -44,6 +44,10 @@ build = [
     "requests>=2.32.4",
 ]
 dev = ["pre-commit>=4.0.1,<5", "ruff>=0.7.4,<0.16", "pytest>=8.0,<9"]
+# Optional: Roboflow-hosted troop detection. Install with
+#     uv sync --group roboflow
+# then run a local inference server with `inference server start`.
+roboflow = ["inference-sdk>=0.20", "inference-cli>=0.20"]
 
 [tool.ruff.lint]
 select = [
