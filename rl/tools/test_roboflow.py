@@ -2,19 +2,22 @@
 
 Prerequisites:
 
-    1. Install Docker Desktop (macOS).
-    2. Install the Roboflow SDK + CLI:
-           uv sync --group roboflow
-    3. Start the local inference server (one-time, keep running):
-           uv run inference server start
-       The server hosts the workflow on http://localhost:9001.
-    4. Get a private API key from https://app.roboflow.com/settings/api
-    5. Export the env vars before running this script:
+    1. Run a local Roboflow inference server. Either:
+         * GUI: download the .dmg from
+           https://github.com/roboflow/inference/releases/latest
+           drag to /Applications, launch it (menu-bar icon).
+         * CLI: `uv sync --group roboflow` then `uv run inference server start`.
+       Either way it listens on http://localhost:9001.
+    2. Get a private API key at https://app.roboflow.com/settings/api
+    3. Export env vars before running this script:
            export ROBOFLOW_API_KEY='<your key>'
-           # The defaults below point at krazyness/CRBot-public's public workflow,
-           # so you can skip these two env vars unless you've forked it:
-           export ROBOFLOW_TROOP_WORKSPACE='NoUId3x2adRSKjiDk3FLO9AJa5o1'
-           export ROBOFLOW_TROOP_WORKFLOW='LLwN9g8GnzpcZeXJKJc1'
+           # Optional. Defaults to the Universe model below if unset.
+           export ROBOFLOW_TROOP_MODEL_ID='nejc-zavodnik/clash-royale-troop-detection/1'
+
+The default model is a public Universe model:
+    https://universe.roboflow.com/nejc-zavodnik/clash-royale-troop-detection
+Universe models are accessible to any account with a valid API key — no
+forking, no workspace gymnastics.
 
 Usage:
 
@@ -29,19 +32,17 @@ Output:
     * Console summary: detections per class, confidence stats, latency.
     * ``roboflow_test.png``: frame with bounding boxes overlaid.
     * ``roboflow_raw.json``: full upstream response so you can inspect the
-      exact shape of the workflow output (useful when the extractor returns
-      empty detections — then you know to adjust ``_extract_predictions``).
+      exact shape of the model output.
 
 Decision criteria from this test:
 
     * p95 latency << FRAME_SKIP_SECONDS (0.6s = 600ms)? → Roboflow is viable.
     * p95 latency ≈ 600ms? → increase FRAME_SKIP_SECONDS or add a GPU.
     * p95 latency > 1s? → drop Roboflow for HSV-based unit detection.
-    * Detections are sensible (troops get tagged, towers don't show up as
-      troops)? → the workflow's classes cover what you need.
-    * Detections are empty even with troops on field? → either ``_extract_predictions``
-      needs tweaking for your workflow's output shape, or the model was
-      trained on a different screen resolution.
+    * Detections sensible (troops tagged, towers not falsely tagged)? → classes ok.
+    * Empty detections even with troops on field? → check roboflow_raw.json:
+      either the model's not loading (first call downloads ~200MB of weights)
+      or the screen resolution differs from what the model expects.
 """
 from __future__ import annotations
 
@@ -56,7 +57,7 @@ import cv2
 import numpy as np
 
 from pyclashbot.utils.platform import is_macos
-from rl.bridge import detect_troops, get_emulator, get_screen
+from rl.bridge import DEFAULT_TROOP_MODEL_ID, detect_troops, get_emulator, get_screen
 
 
 REQUIRED_ENV_VARS = ["ROBOFLOW_API_KEY"]
@@ -71,6 +72,31 @@ def _check_env() -> None:
             print(f"  {k}")
         print("\nSee the module docstring for setup instructions.")
         raise SystemExit(1)
+
+
+def _preflight(frame: np.ndarray) -> int:
+    """Issue one warmup detection before the main workload.
+
+    Fails fast if the server isn't running, the model id is wrong, or
+    auth is broken — so we don't spin through 20 iterations before
+    finding out. Also forces the inference server to download model
+    weights (~200MB on first call), which would otherwise skew the
+    benchmark's first iteration.
+    """
+    print("\nPreflight: one warmup detection (may take 30-60s on first run while")
+    print("the inference server downloads ~200MB of model weights)...")
+    start = time.monotonic()
+    try:
+        detections = detect_troops(frame)
+    except RuntimeError as e:
+        print(f"\nPreflight FAILED:\n\n{e}\n")
+        return 1
+    except Exception as e:  # noqa: BLE001  -- surface unexpected errors verbatim
+        print(f"\nPreflight FAILED with unexpected error:\n  {type(e).__name__}: {e}\n")
+        return 1
+    elapsed_ms = (time.monotonic() - start) * 1000
+    print(f"  OK ({elapsed_ms:.0f}ms, {len(detections)} detections)")
+    return 0
 
 
 def _boot_emulator() -> np.ndarray:
@@ -155,10 +181,12 @@ def run_single(frame: np.ndarray, out_dir: Path) -> int:
     if not detections:
         print(
             "\n[!] No detections returned. Possible causes:\n"
-            "    1. The workflow's output shape isn't handled by _extract_predictions —\n"
-            "       inspect roboflow_raw.json and update bridge.py to match.\n"
-            "    2. The emulator isn't showing an active battle frame with visible troops.\n"
-            "    3. The workflow is pointing at a non-existent workspace/id."
+            "    1. The emulator isn't showing an active battle frame with visible troops.\n"
+            "       Inspect roboflow_test.png and confirm what the model actually saw.\n"
+            "    2. All detections fell below the min_confidence threshold (default 0.25).\n"
+            "       Re-run with a lower threshold by editing detect_troops(min_confidence=0.1).\n"
+            "    3. The model trained on a different screen resolution or skin and doesn't\n"
+            "       generalise to BlueStacks 419x633 frames. Try a different Universe model."
         )
     return 0
 
@@ -220,10 +248,13 @@ def main() -> int:
     frame = _boot_emulator()
     print(f"Got frame: shape={frame.shape}")
 
-    print("\nProbing Roboflow workflow configuration:")
-    print(f"  API URL:   {os.environ.get('ROBOFLOW_API_URL', 'http://localhost:9001')}")
-    print(f"  workspace: {os.environ.get('ROBOFLOW_TROOP_WORKSPACE', 'NoUId3x2adRSKjiDk3FLO9AJa5o1 (default)')}")
-    print(f"  workflow:  {os.environ.get('ROBOFLOW_TROOP_WORKFLOW', 'LLwN9g8GnzpcZeXJKJc1 (default)')}")
+    print("\nProbing Roboflow configuration:")
+    print(f"  API URL:  {os.environ.get('ROBOFLOW_API_URL', 'http://localhost:9001')}")
+    print(f"  model id: {os.environ.get('ROBOFLOW_TROOP_MODEL_ID', f'{DEFAULT_TROOP_MODEL_ID} (default)')}")
+
+    rc = _preflight(frame)
+    if rc != 0:
+        return rc
 
     if args.benchmark > 0:
         return run_benchmark(args.benchmark)

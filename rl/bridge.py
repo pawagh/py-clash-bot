@@ -324,29 +324,31 @@ def read_elixir(frame: np.ndarray) -> int:
 # ----------------------------------------------------------------------
 # Roboflow-hosted troop detection (optional)
 # ----------------------------------------------------------------------
-# The approach comes from https://github.com/krazyness/CRBot-public, which
-# ships two public workflows:
-#   * "troop_detection"       id=LLwN9g8GnzpcZeXJKJc1  (workspace NoUId3x2adRSKjiDk3FLO9AJa5o1)
-#   * "tower_hp_detection"    id=0AfyZRCqRKWaWRyA1F6G  (workspace rmdsbcleSovhA06myP1V)
+# We call a public Roboflow Universe model directly via client.infer(),
+# bypassing the workflow abstraction entirely. Universe models are
+# globally accessible to any account with a valid API key, so there is
+# no fork / workspace gymnastics needed.
 #
-# To avoid hitting Roboflow's cloud endpoint from BlueStacks on every
-# step, we default to a *local* inference server. Install Docker Desktop,
-# `uv sync --group roboflow`, then run `inference server start` once.
-# The local server hosts the workflow on http://localhost:9001 and is
-# latency-bounded by your CPU/GPU, not your network.
+# Default model: nejc-zavodnik/clash-royale-troop-detection (version 1)
+#   https://universe.roboflow.com/nejc-zavodnik/clash-royale-troop-detection
+#
+# To avoid hitting Roboflow's cloud endpoint on every step, point at a
+# local inference server. Two ways to run one:
+#   * GUI: download the Roboflow Inference desktop app from
+#       https://github.com/roboflow/inference/releases/latest
+#     and launch it (menu-bar icon, listens on http://localhost:9001).
+#   * CLI: `uv sync --group roboflow` then `inference server start`.
 #
 # Environment variables consumed here:
-#     ROBOFLOW_API_KEY        — required (your private key from app.roboflow.com)
+#     ROBOFLOW_API_KEY        — required (key from app.roboflow.com/settings/api)
+#     ROBOFLOW_TROOP_MODEL_ID — optional, defaults to the Universe model above
 #     ROBOFLOW_API_URL        — optional, defaults to http://localhost:9001
-#     ROBOFLOW_TROOP_WORKSPACE — workspace_name, e.g. "NoUId3x2adRSKjiDk3FLO9AJa5o1"
-#     ROBOFLOW_TROOP_WORKFLOW  — workflow_id,   e.g. "LLwN9g8GnzpcZeXJKJc1"
-#
-# If you fork the workflow into your own workspace, use your own IDs.
 
 
 DEFAULT_ROBOFLOW_API_URL = "http://localhost:9001"
-DEFAULT_TROOP_WORKSPACE = "NoUId3x2adRSKjiDk3FLO9AJa5o1"
-DEFAULT_TROOP_WORKFLOW = "LLwN9g8GnzpcZeXJKJc1"
+# Public Universe model: https://universe.roboflow.com/nejc-zavodnik/clash-royale-troop-detection
+# Format expected by client.infer(model_id=...) is "<workspace>/<project>/<version>".
+DEFAULT_TROOP_MODEL_ID = "nejc-zavodnik/clash-royale-troop-detection/1"
 
 _ROBOFLOW_CLIENT: Any = None
 
@@ -412,78 +414,72 @@ def get_roboflow_client() -> Any:
 
 
 def _extract_predictions(result: Any) -> list[dict[str, Any]]:
-    """Pull the list of bbox predictions out of a workflow response.
+    """Pull the list of bbox predictions out of a client.infer() response.
 
-    Roboflow workflows wrap detector output in a block-specific key, so
-    the exact shape varies. The common shapes this handles:
+    The infer() endpoint returns a single dict shaped like:
 
-        [{"predictions": {"predictions": [...bboxes...], ...}}]
-        [{"predictions": [...bboxes...]}]
-        [{"<block_name>": {"predictions": [...bboxes...]}}]
-        [{"<block_name>": [...bboxes...]}]
+        {"predictions": [
+             {"x": ..., "y": ..., "width": ..., "height": ...,
+              "class": ..., "confidence": ...,  "class_id": ...},
+             ...
+         ],
+         "image": {"width": ..., "height": ...},
+         "time": ..., ...}
 
     Returns [] on any unrecognised shape so callers can degrade
-    gracefully. Run `rl/tools/test_roboflow.py` to see the raw shape for
-    your specific workflow.
+    gracefully. Run `rl/tools/test_roboflow.py` to see the raw shape
+    for your specific model.
     """
-    if not isinstance(result, list) or not result:
+    if not isinstance(result, dict):
         return []
-
-    def _has_bboxes(seq: Any) -> bool:
-        return (
-            isinstance(seq, list)
-            and len(seq) > 0
-            and isinstance(seq[0], dict)
-            and "class" in seq[0]
-            and "confidence" in seq[0]
-        )
-
-    for block in result:
-        if not isinstance(block, dict):
-            continue
-        for value in block.values():
-            if _has_bboxes(value):
-                return value
-            if isinstance(value, dict):
-                inner = value.get("predictions")
-                if inner is not None and _has_bboxes(inner):
-                    return inner
-    return []
+    preds = result.get("predictions")
+    if not isinstance(preds, list):
+        return []
+    return [p for p in preds if isinstance(p, dict) and "class" in p and "confidence" in p]
 
 
 def detect_troops(
     frame: np.ndarray,
-    workspace_name: str | None = None,
-    workflow_id: str | None = None,
+    model_id: str | None = None,
     min_confidence: float = 0.25,
 ) -> list[TroopDetection]:
-    """Run the Roboflow troop detection workflow on a BGR frame.
+    """Run a Roboflow object-detection model on a BGR frame.
 
     Args:
-        frame: (H, W, 3) BGR image from `get_screen()`.
-        workspace_name: overrides ROBOFLOW_TROOP_WORKSPACE env var.
-        workflow_id: overrides ROBOFLOW_TROOP_WORKFLOW env var.
+        frame: (H, W, 3) BGR image from `get_screen()`. The numpy array
+            is sent directly; the inference server handles encoding.
+        model_id: overrides ROBOFLOW_TROOP_MODEL_ID env var. Format is
+            "<workspace>/<project>/<version>", e.g.
+            "nejc-zavodnik/clash-royale-troop-detection/1".
         min_confidence: drop detections weaker than this.
 
     Returns:
         List of TroopDetection in frame pixel coordinates.
 
     Raises:
-        RuntimeError: if the SDK/server/key is unavailable.
+        RuntimeError: if the SDK/server/key is unavailable, or if the
+            model returns 404 (typically a typo in the model_id).
     """
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
 
-    workspace = workspace_name or os.environ.get("ROBOFLOW_TROOP_WORKSPACE", DEFAULT_TROOP_WORKSPACE)
-    workflow = workflow_id or os.environ.get("ROBOFLOW_TROOP_WORKFLOW", DEFAULT_TROOP_WORKFLOW)
+    chosen_model = model_id or os.environ.get("ROBOFLOW_TROOP_MODEL_ID", DEFAULT_TROOP_MODEL_ID)
 
     client = get_roboflow_client()
-    result = client.run_workflow(
-        workspace_name=workspace,
-        workflow_id=workflow,
-        images={"image": frame},
-        use_cache=False,
-    )
+    try:
+        result = client.infer(frame, model_id=chosen_model)
+    except Exception as e:
+        status = getattr(e, "status_code", None)
+        if status == 404:
+            raise RuntimeError(
+                f"Roboflow returned 404 for model_id='{chosen_model}'.\n"
+                "Causes: the model id is mistyped, the version doesn't exist, or the "
+                "model is private and your API key has no access.\n"
+                "For a public Universe model, copy the path from its URL: "
+                "https://universe.roboflow.com/<workspace>/<project>  →  "
+                "model_id is '<workspace>/<project>/<version>' (most use version 1)."
+            ) from e
+        raise
 
     predictions = _extract_predictions(result)
     detections: list[TroopDetection] = []
