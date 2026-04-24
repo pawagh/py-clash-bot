@@ -346,9 +346,29 @@ def read_elixir(frame: np.ndarray) -> int:
 
 
 DEFAULT_ROBOFLOW_API_URL = "http://localhost:9001"
-# Public Universe model: https://universe.roboflow.com/nejc-zavodnik/clash-royale-troop-detection
-# Format expected by client.infer(model_id=...) is "<workspace>/<project>/<version>".
-DEFAULT_TROOP_MODEL_ID = "nejc-zavodnik/clash-royale-troop-detection/1"
+
+# The format expected by client.infer(model_id=...) is strictly
+# "<project-slug>/<version>" — two parts, NOT three. The SDK source
+# rejects anything else with "InvalidModelIdentifier". Universe project
+# slugs have random suffixes (e.g. `-of3d3`, `-vop4y`) so two parts are
+# enough to uniquely identify any public Universe model globally.
+#
+# Known-working public Clash Royale troop detection models on Universe
+# (pick whichever tests best for your account + BlueStacks resolution):
+#
+#   clash-royale-of3d3/1
+#     https://universe.roboflow.com/clashroyale/clash-royale-of3d3
+#     972 images, 72 classes, the largest general-purpose CR dataset.
+#
+#   ai-clash-royal/1
+#     https://universe.roboflow.com/stefan-ca8zi/ai-clash-royal
+#     Much smaller (28 images) but covers most of the card roster.
+#
+# To use a different model, get its ID from the Universe page:
+#   1. Open the model page in a browser.
+#   2. Click "Deploy" (top right) -> Python tab.
+#   3. The "Copy Model ID" button gives you exactly "<slug>/<version>".
+DEFAULT_TROOP_MODEL_ID = "clash-royale-of3d3/1"
 
 _ROBOFLOW_CLIENT: Any = None
 
@@ -465,19 +485,30 @@ def detect_troops(
 
     chosen_model = model_id or os.environ.get("ROBOFLOW_TROOP_MODEL_ID", DEFAULT_TROOP_MODEL_ID)
 
+    if chosen_model.count("/") != 1:
+        raise RuntimeError(
+            f"Invalid model_id '{chosen_model}'. Expected exactly two parts "
+            "('<project-slug>/<version>'), not three. "
+            "Even for Universe models the SDK strips the workspace prefix — use the "
+            "'Copy Model ID' button on the model's Universe page to get the right string."
+        )
+
     client = get_roboflow_client()
     try:
         result = client.infer(frame, model_id=chosen_model)
     except Exception as e:
         status = getattr(e, "status_code", None)
-        if status == 404:
+        desc = str(getattr(e, "description", e))
+        if status in (400, 404) or "Invalid Model ID" in desc:
             raise RuntimeError(
-                f"Roboflow returned 404 for model_id='{chosen_model}'.\n"
-                "Causes: the model id is mistyped, the version doesn't exist, or the "
-                "model is private and your API key has no access.\n"
-                "For a public Universe model, copy the path from its URL: "
-                "https://universe.roboflow.com/<workspace>/<project>  →  "
-                "model_id is '<workspace>/<project>/<version>' (most use version 1)."
+                f"Roboflow rejected model_id='{chosen_model}' (status={status}).\n"
+                f"  api_message: {getattr(e, 'api_message', desc)}\n\n"
+                "Causes (ranked by likelihood):\n"
+                "  1. Project slug mistyped or the Universe page was deleted.\n"
+                "  2. Version number doesn't exist (try /1 if you had /2).\n"
+                "  3. Private model — your API key has no access.\n\n"
+                "Fix: open the model's Universe page, click 'Deploy', and use the exact\n"
+                "string under 'Copy Model ID' (should contain exactly one '/')."
             ) from e
         raise
 

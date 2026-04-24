@@ -11,13 +11,18 @@ Prerequisites:
     2. Get a private API key at https://app.roboflow.com/settings/api
     3. Export env vars before running this script:
            export ROBOFLOW_API_KEY='<your key>'
-           # Optional. Defaults to the Universe model below if unset.
-           export ROBOFLOW_TROOP_MODEL_ID='nejc-zavodnik/clash-royale-troop-detection/1'
+           # Optional. Defaults to 'clash-royale-of3d3/1' if unset.
+           export ROBOFLOW_TROOP_MODEL_ID='<project-slug>/<version>'
 
-The default model is a public Universe model:
-    https://universe.roboflow.com/nejc-zavodnik/clash-royale-troop-detection
-Universe models are accessible to any account with a valid API key — no
-forking, no workspace gymnastics.
+IMPORTANT — model_id format:
+    The SDK requires exactly two parts: '<project-slug>/<version>'.
+    NOT '<workspace>/<project>/<version>' (that returns 400 Invalid Model ID).
+    Universe project slugs have unique random suffixes, so two parts is enough.
+
+To find the right model_id: open a public Clash Royale detection project on
+Universe, click 'Deploy' (top right), and copy the string from 'Copy Model ID'.
+Default points at https://universe.roboflow.com/clashroyale/clash-royale-of3d3
+which is a public model with 72 classes, accessible to any valid API key.
 
 Usage:
 
