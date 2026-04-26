@@ -41,7 +41,15 @@ from typing import ClassVar
 import cv2
 import numpy as np
 
-from rl.bridge import get_screen, is_battle_over, is_in_battle
+from rl.bridge import (
+    ARENA_MIDLINE_Y,
+    TroopDetection,
+    classify_detection,
+    get_screen,
+    is_battle_over,
+    is_in_battle,
+    summarize_detections,
+)
 
 
 @dataclass
@@ -92,6 +100,19 @@ class RewardCalculator:
     # steady-state friendly mass; the clip is a second line of defense.
     UNIT_DIFF_REWARD: ClassVar[float] = 0.003
     UNIT_DIFF_CLIP: ClassVar[float] = 0.15
+
+    # Detection-based unit count differential. When Roboflow is online
+    # we get exact integer counts of friendly/enemy troops on the board
+    # instead of pixel masses, so the per-unit weight is much higher
+    # than UNIT_DIFF_REWARD. Capped per-step to prevent a flicker of
+    # detection (a unit briefly missed for one frame and recovered the
+    # next) from blowing up the reward.
+    TROOP_COUNT_REWARD: ClassVar[float] = 0.05
+    TROOP_COUNT_CLIP: ClassVar[float] = 0.20
+    # Bonus when the agent plays into a lane that already has a visible
+    # enemy troop on the agent's side. Higher than LANE_DEFENSE_BONUS
+    # because detections are far more reliable than red-HP-bar HSV.
+    TROOP_LANE_DEFENSE_BONUS: ClassVar[float] = 0.05
 
     # Time-structured shaping
     URGENCY_COEF: ClassVar[float] = -0.002
@@ -190,6 +211,7 @@ class RewardCalculator:
         self.prev_tower_hps_my: tuple[float, float, float] = (1.0, 1.0, 1.0)
         self.prev_tower_hps_opp: tuple[float, float, float] = (1.0, 1.0, 1.0)
         self.prev_unit_diff: int = 0
+        self.prev_troop_count_diff: int = 0
         self._was_in_battle = False
         self._battle_start_time: float | None = None
 
@@ -200,6 +222,7 @@ class RewardCalculator:
         self.prev_tower_hps_my = (1.0, 1.0, 1.0)
         self.prev_tower_hps_opp = (1.0, 1.0, 1.0)
         self.prev_unit_diff = 0
+        self.prev_troop_count_diff = 0
         self._was_in_battle = False
         self._battle_start_time = None
 
@@ -210,11 +233,20 @@ class RewardCalculator:
         self,
         info: StepInfo,
         frame: np.ndarray | None = None,
+        detections: list[TroopDetection] | None = None,
     ) -> tuple[float, bool]:
         """Return (reward, terminated) for the current step.
 
         If `frame` is None, one is pulled from the emulator; pass one
         in from the env step loop to avoid a redundant screenshot.
+
+        If `detections` is provided (Roboflow troop detection enabled),
+        the unit-mass and lane-defense components are driven by those
+        detections instead of HSV color masks. Detection-based signals
+        are far more reliable than HSV (no false positives from UI
+        chrome, no missed units due to non-red HP bars), so when
+        available they get higher coefficients. When `detections=None`,
+        we fall back to the HSV components silently.
         """
         if frame is None:
             try:
@@ -236,8 +268,16 @@ class RewardCalculator:
         reward += self._score_elixir(frame, info)
         reward += self._score_crowns(frame)
         reward += self._score_tower_hp(frame)
-        reward += self._score_unit_differential(frame)
-        reward += self._score_lane_defense(frame, info)
+
+        if detections is not None:
+            # Detection-based shaping is strictly better than HSV when
+            # available — replace, don't stack.
+            reward += self._score_troop_count_diff(detections)
+            reward += self._score_troop_lane_defense(detections, info)
+        else:
+            reward += self._score_unit_differential(frame)
+            reward += self._score_lane_defense(frame, info)
+
         reward += self._score_urgency()
 
         terminated = False
@@ -316,6 +356,60 @@ class RewardCalculator:
             return self.LANE_DEFENSE_BONUS
         if not played_left and right_present:
             return self.LANE_DEFENSE_BONUS
+        return 0.0
+
+    def _score_troop_count_diff(
+        self, detections: list[TroopDetection]
+    ) -> float:
+        """Detection-based unit count differential (board-state shaping).
+
+        Equivalent in spirit to `_score_unit_differential` but uses
+        Roboflow integer counts instead of HSV pixel masses. Telescopes
+        over the episode (a unit added then later killed yields net
+        zero), so it cannot be exploited by spamming cheap troops.
+        Per-step delta is hard-clipped to TROOP_COUNT_CLIP to bound the
+        impact of one-frame detection flicker.
+        """
+        friendly, enemy = summarize_detections(detections)
+        curr_diff = friendly - enemy
+        delta = curr_diff - self.prev_troop_count_diff
+        self.prev_troop_count_diff = curr_diff
+        shaped = self.TROOP_COUNT_REWARD * delta
+        return max(-self.TROOP_COUNT_CLIP, min(self.TROOP_COUNT_CLIP, shaped))
+
+    def _score_troop_lane_defense(
+        self,
+        detections: list[TroopDetection],
+        info: StepInfo,
+    ) -> float:
+        """Bonus for placing a card in the lane of an enemy on our half.
+
+        An enemy detection counts as a threat when its center is below
+        ARENA_MIDLINE_Y (i.e. already past the bridge into the agent's
+        half). The lane is determined by x vs LANE_SPLIT_X. Unlike the
+        HSV version this works regardless of HP-bar visibility, so
+        spawn-protected and freshly-deployed enemies still register.
+        """
+        if not info.card_played or info.play_x < 0:
+            return 0.0
+
+        threat_left = False
+        threat_right = False
+        for det in detections:
+            if classify_detection(det) != "enemy":
+                continue
+            if det.y < ARENA_MIDLINE_Y:
+                continue
+            if det.x < self.LANE_SPLIT_X:
+                threat_left = True
+            else:
+                threat_right = True
+
+        played_left = info.play_x < self.LANE_SPLIT_X
+        if played_left and threat_left:
+            return self.TROOP_LANE_DEFENSE_BONUS
+        if not played_left and threat_right:
+            return self.TROOP_LANE_DEFENSE_BONUS
         return 0.0
 
     def _score_unit_differential(self, frame: np.ndarray | None) -> float:

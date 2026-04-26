@@ -24,6 +24,7 @@ import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+import cv2
 import numpy as np
 
 from pyclashbot.bot.fight import (
@@ -197,11 +198,18 @@ def return_to_main_menu() -> bool:
 
 
 __all__ = [
+    "ARENA_MIDLINE_Y",
     "HAND_CARDS_COORDS",
     "NUM_CARD_IDS",
     "SCREEN_H",
     "SCREEN_W",
+    "TROOPS_HEATMAP_CHANNELS",
+    "TROOPS_HEATMAP_H",
+    "TROOPS_HEATMAP_SHAPE",
+    "TROOPS_HEATMAP_W",
+    "Side",
     "TroopDetection",
+    "classify_detection",
     "click",
     "detect_troops",
     "get_card_id_map",
@@ -212,11 +220,13 @@ __all__ = [
     "is_battle_over",
     "is_in_battle",
     "is_on_main_menu",
+    "rasterize_detections",
     "read_elixir",
     "read_hand",
     "return_to_main_menu",
     "set_emulator",
     "start_battle",
+    "summarize_detections",
     "swipe",
 ]
 
@@ -353,22 +363,25 @@ DEFAULT_ROBOFLOW_API_URL = "http://localhost:9001"
 # slugs have random suffixes (e.g. `-of3d3`, `-vop4y`) so two parts are
 # enough to uniquely identify any public Universe model globally.
 #
-# Known-working public Clash Royale troop detection models on Universe
-# (pick whichever tests best for your account + BlueStacks resolution):
+# Known-working public Clash Royale troop detection models on Universe.
+# Pick whichever tests best for your account + BlueStacks resolution
+# (override at runtime with the ROBOFLOW_TROOP_MODEL_ID env var).
+#
+#   clash-royale-xy2jw/2  ← current default
+#     https://universe.roboflow.com/workspace-mck69/clash-royale-xy2jw/model/2
 #
 #   clash-royale-of3d3/1
 #     https://universe.roboflow.com/clashroyale/clash-royale-of3d3
-#     972 images, 72 classes, the largest general-purpose CR dataset.
+#     972 images, 72 classes, large but old (2022).
 #
-#   ai-clash-royal/1
-#     https://universe.roboflow.com/stefan-ca8zi/ai-clash-royal
-#     Much smaller (28 images) but covers most of the card roster.
+#   clash-royale-ut3g8/1
+#     https://universe.roboflow.com/yolotrain-c7s7v/clash-royale-ut3g8
 #
 # To use a different model, get its ID from the Universe page:
 #   1. Open the model page in a browser.
 #   2. Click "Deploy" (top right) -> Python tab.
 #   3. The "Copy Model ID" button gives you exactly "<slug>/<version>".
-DEFAULT_TROOP_MODEL_ID = "clash-royale-of3d3/1"
+DEFAULT_TROOP_MODEL_ID = "clash-royale-xy2jw/2"
 
 _ROBOFLOW_CLIENT: Any = None
 
@@ -536,3 +549,138 @@ def detect_troops(
         except (KeyError, TypeError, ValueError):
             continue
     return detections
+
+
+# ----------------------------------------------------------------------
+# Detection -> RL signal helpers
+# ----------------------------------------------------------------------
+# The arena is symmetric: the bottom half (y >= ARENA_MIDLINE_Y) is the
+# agent's side, the top half is the opponent's. Most Roboflow troop-
+# detection models include team info in the class name ("ally", "enemy",
+# "blue", "red", "friendly", ...) but the convention varies model-to-
+# model. We use a hybrid classifier: trust class-name keywords when they
+# exist, fall back to y-position. Position is reliable because the camera
+# never rotates and pyclashbot only ever fights on the bottom half.
+
+ARENA_MIDLINE_Y = 300
+
+# Heatmap geometry. NatureCNN (SB3's default image extractor for boxes
+# with 3-d shape) requires inputs >= 36 px on each spatial dim, so 64x64
+# is the smallest sensible size. Two channels: friendly / enemy.
+TROOPS_HEATMAP_H = 64
+TROOPS_HEATMAP_W = 64
+TROOPS_HEATMAP_CHANNELS = 2
+TROOPS_HEATMAP_SHAPE = (TROOPS_HEATMAP_H, TROOPS_HEATMAP_W, TROOPS_HEATMAP_CHANNELS)
+
+Side = Literal["friendly", "enemy", "tower", "unknown"]
+
+# Class-name keyword maps. Lowercased, substring-matched. Order matters:
+# tower keywords are checked before team keywords so e.g.
+# "Enemy King Tower" classifies as TOWER (not ENEMY troop). Tower
+# detections are excluded from the heatmap on purpose — the policy
+# already learns tower locations from the pixel input, and tower bboxes
+# are huge so they would dominate the heatmap if included.
+_TOWER_KEYWORDS = ("tower", "king", "princess")
+_FRIENDLY_KEYWORDS = ("ally", "friend", "blue", "self", " my ", "my-", "my_")
+_ENEMY_KEYWORDS = ("enemy", "opp", "red", "foe", "hostile")
+
+
+def classify_detection(det: TroopDetection) -> Side:
+    """Classify a detection as friendly troop / enemy troop / tower.
+
+    Resolution order:
+        1. Tower keywords in the class name -> TOWER (always, regardless
+           of position). Tower bboxes are too large to be useful as
+           "unit mass" signals.
+        2. Team keywords in the class name (ally/enemy/blue/red/...) ->
+           FRIENDLY or ENEMY. Trusts the model's labels.
+        3. Fall back to y-coordinate vs ARENA_MIDLINE_Y: top half is
+           enemy, bottom half is friendly. Reliable because the camera
+           never rotates.
+    """
+    name = det.cls.lower()
+    for kw in _TOWER_KEYWORDS:
+        if kw in name:
+            return "tower"
+    for kw in _FRIENDLY_KEYWORDS:
+        if kw in name:
+            return "friendly"
+    for kw in _ENEMY_KEYWORDS:
+        if kw in name:
+            return "enemy"
+    return "enemy" if det.y < ARENA_MIDLINE_Y else "friendly"
+
+
+def summarize_detections(
+    detections: list[TroopDetection] | None,
+) -> tuple[int, int]:
+    """Return (friendly_troop_count, enemy_troop_count) for shaping.
+
+    Towers are excluded from both counts. Returns (0, 0) for None /
+    empty input so callers can use the result unconditionally.
+    """
+    if not detections:
+        return 0, 0
+    friendly = 0
+    enemy = 0
+    for det in detections:
+        side = classify_detection(det)
+        if side == "friendly":
+            friendly += 1
+        elif side == "enemy":
+            enemy += 1
+    return friendly, enemy
+
+
+def rasterize_detections(
+    detections: list[TroopDetection] | None,
+    out_shape: tuple[int, int, int] = TROOPS_HEATMAP_SHAPE,
+    blur_kernel: int = 5,
+) -> np.ndarray:
+    """Render detections as a 2-channel uint8 heatmap.
+
+    Channel 0 is friendly mass, channel 1 is enemy mass. Each non-tower
+    detection is splatted as a filled circle at its scaled center, with
+    radius proportional to the bbox size and intensity proportional to
+    confidence. The whole map is then Gaussian-blurred so the policy
+    can interpolate between adjacent positions instead of treating each
+    detection as a delta.
+
+    The output is HWC uint8 in [0, 255] — the same dtype/layout SB3
+    expects for image observations, so it routes through NatureCNN
+    automatically.
+    """
+    h, w, c = out_shape
+    if not detections:
+        return np.zeros((h, w, c), dtype=np.uint8)
+
+    # Draw into per-channel contiguous buffers — cv2.circle rejects
+    # non-contiguous numpy slices (e.g. heatmap[:, :, ch]).
+    channels = [np.zeros((h, w), dtype=np.uint8) for _ in range(c)]
+
+    sx = w / SCREEN_W
+    sy = h / SCREEN_H
+
+    for det in detections:
+        side = classify_detection(det)
+        if side == "friendly":
+            ch = 0
+        elif side == "enemy":
+            ch = 1
+        else:
+            continue
+        cx = int(round(det.x * sx))
+        cy = int(round(det.y * sy))
+        if not (0 <= cx < w and 0 <= cy < h):
+            continue
+        # Radius scales with bbox size in heatmap coords. Floor at 2 so
+        # tiny detections still register; cap at 1/4 of frame so a
+        # single huge bbox can't blanket the map.
+        radius = int(max(2, min(min(h, w) // 4, ((det.width + det.height) / 4) * sx)))
+        intensity = int(max(0, min(255, round(255 * det.confidence))))
+        cv2.circle(channels[ch], (cx, cy), radius, (float(intensity),), thickness=-1)
+
+    if blur_kernel > 1:
+        for i in range(c):
+            channels[i] = cv2.GaussianBlur(channels[i], (blur_kernel, blur_kernel), 0)
+    return np.stack(channels, axis=-1)
