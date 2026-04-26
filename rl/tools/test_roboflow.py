@@ -26,11 +26,15 @@ which is a public model with 72 classes, accessible to any valid API key.
 
 Usage:
 
-    # Start BlueStacks, enter a Trophy Road battle, wait until troops are on field
+    # Default: prompt before capture so you can manually start a battle.
     uv run python -m rl.tools.test_roboflow
 
-    # Latency benchmark (run 20 back-to-back detections):
-    uv run python -m rl.tools.test_roboflow --benchmark 20
+    # Auto-navigate into a Trophy Road match using rl.bridge.start_battle():
+    uv run python -m rl.tools.test_roboflow --battle-mode auto
+
+    # Latency benchmark (run 20 back-to-back detections; you must already be
+    # inside a battle when iteration 1 fires):
+    uv run python -m rl.tools.test_roboflow --battle-mode auto --benchmark 20
 
 Output:
 
@@ -62,7 +66,14 @@ import cv2
 import numpy as np
 
 from pyclashbot.utils.platform import is_macos
-from rl.bridge import DEFAULT_TROOP_MODEL_ID, detect_troops, get_emulator, get_screen
+from rl.bridge import (
+    DEFAULT_TROOP_MODEL_ID,
+    detect_troops,
+    get_emulator,
+    get_screen,
+    is_in_battle,
+    start_battle,
+)
 
 
 REQUIRED_ENV_VARS = ["ROBOFLOW_API_KEY"]
@@ -116,6 +127,45 @@ def _boot_emulator() -> np.ndarray:
     if frame.ndim != 3 or frame.shape[2] != 3:
         raise RuntimeError(f"Expected BGR frame, got shape={frame.shape}")
     return frame
+
+
+def _wait_for_user_in_battle(troop_settle_secs: float) -> np.ndarray:
+    """Pause until the user manually navigates into a battle, then capture.
+
+    Useful when the auto-navigator (start_battle) has trouble — for
+    example because Trophy Road is gated behind a tutorial, or you want
+    to test on a 2v2 / Ladder match the auto-navigator doesn't pick.
+    """
+    print(
+        "\nManual mode: navigate into a Clash Royale battle inside the "
+        "BlueStacks 'pyclashbot-136' window."
+    )
+    print(f"Wait until BOTH sides have troops on the field, then add ~{troop_settle_secs:.0f}s")
+    print("of buffer so the model sees a non-trivial frame.")
+    input("Press Enter when ready to capture... ")
+    if troop_settle_secs > 0:
+        print(f"  Letting troops settle for {troop_settle_secs:.0f}s...")
+        time.sleep(troop_settle_secs)
+    frame = get_screen()
+    if not is_in_battle():
+        print("  [!] is_in_battle() returned False — the captured frame may not be a battle.")
+    return frame
+
+
+def _auto_navigate_into_battle(troop_settle_secs: float) -> np.ndarray:
+    """Use rl.bridge.start_battle() to enter a Trophy Road match.
+
+    After the battle starts, sleep so opponent troops can spawn before
+    we grab a frame. If start_battle() fails (e.g. the account is
+    mid-tutorial), fall back to manual mode.
+    """
+    print("\nAuto mode: navigating to a Trophy Road battle via rl.bridge.start_battle()...")
+    if not start_battle():
+        print("  [!] start_battle() failed. Falling back to manual mode.")
+        return _wait_for_user_in_battle(troop_settle_secs)
+    print(f"  Battle started. Waiting {troop_settle_secs:.0f}s for troops to spawn...")
+    time.sleep(troop_settle_secs)
+    return get_screen()
 
 
 def _summarize(detections: list) -> None:
@@ -245,21 +295,39 @@ def main() -> int:
                         help="Run N back-to-back detections to measure latency (0=single run)")
     parser.add_argument("--out-dir", type=Path, default=Path("."),
                         help="Where to write roboflow_test.png and roboflow_raw.json")
+    parser.add_argument("--battle-mode", choices=["manual", "auto", "skip"], default="manual",
+                        help="manual: prompt before capture so you can navigate yourself "
+                             "(default). auto: invoke rl.bridge.start_battle() automatically. "
+                             "skip: capture immediately after boot (only useful for debugging).")
+    parser.add_argument("--troop-settle-secs", type=float, default=15.0,
+                        help="Seconds to wait between confirming you're in a battle and "
+                             "capturing, so opponent troops have time to spawn (default: 15).")
     args = parser.parse_args()
 
     _check_env()
 
     print("Booting emulator (first run may take 30-60s)...")
-    frame = _boot_emulator()
-    print(f"Got frame: shape={frame.shape}")
+    boot_frame = _boot_emulator()
+    print(f"Boot frame: shape={boot_frame.shape}")
 
     print("\nProbing Roboflow configuration:")
     print(f"  API URL:  {os.environ.get('ROBOFLOW_API_URL', 'http://localhost:9001')}")
     print(f"  model id: {os.environ.get('ROBOFLOW_TROOP_MODEL_ID', f'{DEFAULT_TROOP_MODEL_ID} (default)')}")
 
-    rc = _preflight(frame)
+    # Run preflight on the post-boot frame (probably the main menu) so we
+    # confirm auth + connectivity BEFORE waiting for a battle. That way a
+    # broken setup fails fast rather than after the user navigates.
+    rc = _preflight(boot_frame)
     if rc != 0:
         return rc
+
+    if args.battle_mode == "manual":
+        frame = _wait_for_user_in_battle(args.troop_settle_secs)
+    elif args.battle_mode == "auto":
+        frame = _auto_navigate_into_battle(args.troop_settle_secs)
+    else:
+        frame = boot_frame
+    print(f"Capture frame: shape={frame.shape}")
 
     if args.benchmark > 0:
         return run_benchmark(args.benchmark)
