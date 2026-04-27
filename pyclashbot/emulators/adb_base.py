@@ -67,6 +67,15 @@ class AdbBasedController(BaseEmulatorController, ABC):
         """Swipe on the screen using ADB input swipe."""
         self.adb(f"shell input swipe {x_coord1} {y_coord1} {x_coord2} {y_coord2}")
 
+    def send_back_key(self):
+        """Send the Android back-key (KEYCODE_BACK = 4) via ADB.
+
+        Used by post-battle recovery to dismiss popups whose close control
+        cannot be located visually. Cheaper and safer than guessing a
+        deadspace coordinate, which can land on a popup CTA.
+        """
+        self.adb("shell input keyevent 4")
+
     def screenshot(self) -> np.ndarray:
         """
         Capture a screenshot using ADB 'exec-out screencap -p'.

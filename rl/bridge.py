@@ -36,12 +36,14 @@ from pyclashbot.bot.fight import (
 )
 from pyclashbot.bot.nav import (
     check_if_battle_has_ended,
+    check_if_battle_mode_is_selected,
     check_if_in_battle,
     check_if_on_clash_main_menu,
     select_mode,
     wait_for_battle_start,
     wait_for_clash_main_menu,
 )
+from pyclashbot.utils.cancellation import interruptible_sleep
 from pyclashbot.utils.logger import Logger
 from pyclashbot.utils.platform import is_macos
 
@@ -172,19 +174,36 @@ def is_battle_over() -> bool:
 def start_battle(mode: FightMode = DEFAULT_MODE, start_timeout: int = 120) -> bool:
     """Navigate from the main menu to an active battle.
 
-    Mirrors what fight.do_fight_state does on entry:
-      1. ensure we're on main,
-      2. select_mode(...) to pick the fight type,
-      3. start_fight(...) to click the battle button,
-      4. wait_for_battle_start(...) for the scoreboard pixels.
+    Mirrors what fight.do_fight_state does on entry, plus a verify-then-
+    retry gate around mode selection: we never click the Battle button
+    until check_if_battle_mode_is_selected confirms the requested mode
+    is the highlighted one. This kills the failure mode where
+    select_mode silently leaves a different mode selected (e.g. Merge
+    Tactics) and the bot starts the wrong match.
     """
     emulator = get_emulator()
     logger = get_logger()
 
     if not wait_for_clash_main_menu(emulator, logger, deadspace_click=True):
         return False
-    if not select_mode(emulator, mode):
+
+    # Verify-and-retry: click Battle ONLY once the requested mode is the
+    # confirmed-selected mode. Three attempts before giving up — the
+    # caller (env.reset) escalates further on False.
+    mode_confirmed = False
+    for _ in range(3):
+        if check_if_battle_mode_is_selected(emulator, mode):
+            mode_confirmed = True
+            break
+        if not select_mode(emulator, mode):
+            # select_mode failed (couldn't find the icon); send back-key
+            # in case we're trapped in the mode-selection scroll panel,
+            # then retry from the top.
+            emulator.send_back_key()
+            interruptible_sleep(1)
+    if not mode_confirmed:
         return False
+
     if not start_fight(emulator, logger, mode):
         return False
     return wait_for_battle_start(emulator, logger, timeout=start_timeout)

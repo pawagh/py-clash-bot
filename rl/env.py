@@ -55,6 +55,7 @@ from rl.bridge import (
     TroopDetection,
     click,
     detect_troops,
+    get_emulator,
     get_screen,
     is_in_battle,
     rasterize_detections,
@@ -169,10 +170,36 @@ class ClashRoyaleEnv(gym.Env):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+        """Self-healing episode reset.
+
+        3 in-process attempts to return-to-main + start-battle. If all
+        three fail, fall back to emulator.restart() — the same escape
+        hatch pyclashbot's production state machine uses
+        (pyclashbot/bot/states.py:257). This means a stuck-screen stall
+        costs at most ~30 s of restart time instead of pausing the
+        whole training run for human intervention.
+        """
         super().reset(seed=seed)
         self.reward_calc.reset()
 
-        if not is_in_battle():
+        for _ in range(3):
+            if is_in_battle():
+                break
+            if return_to_main_menu() and start_battle(
+                self.mode, start_timeout=RESET_WAIT_TIMEOUT
+            ):
+                break
+            # Kick the emulator with back-key before retrying — most
+            # commonly the bot is trapped in a popup whose visual
+            # template we don't have yet.
+            try:
+                get_emulator().send_back_key()
+            except Exception as e:
+                print(f"[ClashRoyaleEnv.reset] back-key send failed: {e}")
+            interruptible_sleep(2)
+        else:
+            print("[ClashRoyaleEnv.reset] 3 attempts failed; restarting emulator.")
+            get_emulator().restart()
             return_to_main_menu()
             start_battle(self.mode, start_timeout=RESET_WAIT_TIMEOUT)
 

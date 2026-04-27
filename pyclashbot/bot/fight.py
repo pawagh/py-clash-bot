@@ -11,7 +11,7 @@ from pyclashbot.bot.card_detection import (
     get_play_coords_for_card,
     switch_side,
 )
-from pyclashbot.bot.constants import CLASH_MAIN_DEADSPACE_COORD
+from pyclashbot.bot.constants import CLASH_MAIN_DEADSPACE_COORD, CLASH_MAIN_HOME_TAB_COORD
 from pyclashbot.bot.nav import (
     check_for_in_battle_with_delay,
     check_for_trophy_reward_menu,
@@ -20,8 +20,14 @@ from pyclashbot.bot.nav import (
     check_if_on_clash_main_menu,
     get_to_activity_log,
     handle_trophy_reward_menu,
+    select_mode,
     wait_for_battle_start,
     wait_for_clash_main_menu,
+)
+from pyclashbot.bot.post_battle_recovery import (
+    detect_bad_screen,
+    is_on_trophy_road_battle_screen,
+    try_dismiss_current_screen,
 )
 from pyclashbot.bot.recorder import save_play, save_win_loss
 from pyclashbot.detection.image_rec import (
@@ -460,46 +466,82 @@ def find_post_battle_button(emulator):
 
 
 def get_to_main_after_fight(emulator, logger):
-    timeout = 120  # s
+    """Return to the Trophy Road battle screen after a fight ends.
+
+    Strategy each tick (1 s, up to 60 s total):
+      1. If we're on main with Trophy Road selected -> done.
+      2. If we're on main but a different mode is selected -> reselect.
+      3. Log any known bad screen we drifted onto (Festival Market,
+         Welcome Gift, Community Event, ...).
+      4. Try to dismiss whatever's on screen via templates: trophy
+         reward, trophy-road overlay OK, popup close-X, popup
+         bottom-Close, post-battle OK/Exit.
+      5. If nothing dismissed, escalate this tick: ADB back-key first,
+         then home-tab click, then deadspace as last resort.
+
+    Failing fast (60 s vs the old 120 s) lets the env retry — see
+    rl/env.py reset(), which falls back to emulator.restart().
+    """
+    timeout = 60  # s
     start_time = time.time()
     clicked_ok_or_exit = False
+    no_progress_ticks = 0
 
     logger.change_status("Returning to clash main after the fight...")
 
     while time.time() - start_time < timeout:
-        # if on clash main
-        if check_if_on_clash_main_menu(emulator) is True:
-            # wait 3 seconds for the trophy road page to maybe appear bc of UI lag
-            interruptible_sleep(3)
-
-            # if that trophy road page appears, handle it, then return True
-            if check_for_trophy_reward_menu(emulator):
-                print("Found trophy reward menu")
-                handle_trophy_reward_menu(emulator, logger, printmode=False)
-                interruptible_sleep(2)
-
-            print("Made it to clash main after a fight")
+        # 1. Positive exit: main menu AND Trophy Road selected.
+        if is_on_trophy_road_battle_screen(emulator):
+            print("Made it to clash main on Trophy Road")
             return True
 
-        # check for trophy reward screen
-        if check_for_trophy_reward_menu(emulator):
-            print("Found trophy reward menu!\nHandling Trophy Reward Menu")
-            handle_trophy_reward_menu(emulator, logger, printmode=False)
-            interruptible_sleep(3)
+        # 2. On main but wrong mode -> reselect Trophy Road.
+        if check_if_on_clash_main_menu(emulator):
+            print("On main but Trophy Road not selected; reselecting.")
+            select_mode(emulator, "Trophy Road")
+            no_progress_ticks = 0
+            interruptible_sleep(1)
             continue
 
-        # check for post-battle button (OK/exit)
+        # 3. Diagnostic: which bad screen are we stuck on?
+        bad = detect_bad_screen(emulator)
+        if bad is not None:
+            print(f"Detected bad screen: {bad}, attempting dismissal.")
+
+        # 4. Visual dismissal layer.
+        dismissed = try_dismiss_current_screen(emulator, logger)
+        if dismissed is not None:
+            print(f"Dismissed: {dismissed}")
+            no_progress_ticks = 0
+            interruptible_sleep(2)
+            continue
+
+        # 4b. Post-battle OK/Exit (legacy path; click once).
         if not clicked_ok_or_exit:
             button_coord = find_post_battle_button(emulator)
             if button_coord is not None:
                 print("Found post-battle button, clicking it.")
                 emulator.click(button_coord[0], button_coord[1])
                 clicked_ok_or_exit = True
+                no_progress_ticks = 0
+                interruptible_sleep(1)
                 continue
 
+        # 5. Escalation: nothing matched -> back-key, then home-tab,
+        # then deadspace. Cycles so we don't get stuck repeating the
+        # same useless action.
+        no_progress_ticks += 1
+        if no_progress_ticks <= 2:
+            print("No popup matched, sending back-key.")
+            emulator.send_back_key()
+        elif no_progress_ticks <= 4:
+            print("Still stuck, clicking bottom Battle/Home tab.")
+            emulator.click(CLASH_MAIN_HOME_TAB_COORD[0], CLASH_MAIN_HOME_TAB_COORD[1])
+        else:
+            print("Last resort: clicking deadspace.")
+            emulator.click(CLASH_MAIN_DEADSPACE_COORD[0], CLASH_MAIN_DEADSPACE_COORD[1])
+
         interruptible_sleep(1)
-        print("Clicking on deadspace to close potential pop-up windows.")
-        emulator.click(CLASH_MAIN_DEADSPACE_COORD[0], CLASH_MAIN_DEADSPACE_COORD[1])
 
     return False
 
