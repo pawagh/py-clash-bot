@@ -220,8 +220,14 @@ __all__ = [
     "ARENA_MIDLINE_Y",
     "HAND_CARDS_COORDS",
     "NUM_CARD_IDS",
+    "NUM_DETECTION_SLOTS",
+    "NUM_SIDES",
     "SCREEN_H",
     "SCREEN_W",
+    "SIDE_EMPTY",
+    "SIDE_ENEMY",
+    "SIDE_FRIENDLY",
+    "SIDE_TOWER",
     "TROOPS_HEATMAP_CHANNELS",
     "TROOPS_HEATMAP_H",
     "TROOPS_HEATMAP_SHAPE",
@@ -231,6 +237,7 @@ __all__ = [
     "classify_detection",
     "click",
     "detect_troops",
+    "encode_detections",
     "get_card_id_map",
     "get_emulator",
     "get_logger",
@@ -247,6 +254,7 @@ __all__ = [
     "start_battle",
     "summarize_detections",
     "swipe",
+    "troop_class_to_id",
 ]
 
 
@@ -283,6 +291,252 @@ def get_card_id_map() -> dict[str, int]:
 # time from pyclashbot's classifier; keeps the RL observation space in
 # sync with pyclashbot even if more cards are added upstream.
 NUM_CARD_IDS: int = len(get_card_id_map())
+
+
+# ----------------------------------------------------------------------
+# Troop class -> id mapping for Roboflow detections.
+# ----------------------------------------------------------------------
+# We reuse the card vocabulary because the vast majority of troop
+# detections share names with the card that spawns them (Knight, Mini
+# Pekka, Mega Knight, ...). Sharing means the policy can develop a
+# single embedding per unit type that's reused whether the unit is in
+# the agent's hand or on the board, which is genuinely useful: knowing
+# "I have Mini Pekka in hand AND there's a Mini Pekka on the board"
+# uses one weight, not two unrelated ones.
+#
+# Non-card detections (King Tower, Princess Tower, projectiles, etc.)
+# fall back to UNKNOWN id 0 unless their class name happens to substring-
+# match a card name. classify_detection() already separates towers via
+# its own keyword set, so they're labeled correctly even when their
+# class id is UNKNOWN.
+
+_TROOP_CLASS_TO_ID: dict[str, int] = {}
+
+
+def _build_troop_class_lookup() -> dict[str, int]:
+    """Lowercased name -> card-vocab id, with normalized punctuation.
+
+    Built lazily on first use so we can extend `card_color_data` in
+    pyclashbot upstream without re-importing the bridge.
+    """
+    global _TROOP_CLASS_TO_ID
+    if _TROOP_CLASS_TO_ID:
+        return _TROOP_CLASS_TO_ID
+    id_map = get_card_id_map()
+    lookup: dict[str, int] = {}
+    for name, idx in id_map.items():
+        if name == "UNKNOWN":
+            continue
+        norm = name.lower().replace("_", " ").replace("-", " ").strip()
+        lookup[norm] = idx
+    _TROOP_CLASS_TO_ID = lookup
+    return _TROOP_CLASS_TO_ID
+
+
+def troop_class_to_id(class_name: str) -> int:
+    """Map a Roboflow detection class name to a card-vocab integer id.
+
+    Returns 0 (UNKNOWN) for class names that don't substring-match any
+    card. Tolerates underscore / hyphen / casing variants.
+    """
+    if not class_name:
+        return 0
+    norm = class_name.lower().replace("_", " ").replace("-", " ").strip()
+    lookup = _build_troop_class_lookup()
+    # Exact match first.
+    if norm in lookup:
+        return lookup[norm]
+    # Substring match — handles e.g. "knight blue" -> "knight",
+    # "MiniPEKKA" (after norm "minipekka") -> "mini pekka".
+    for cand_name, idx in lookup.items():
+        if cand_name in norm or norm in cand_name:
+            return idx
+    return 0
+
+
+# Number of detections we expose to the policy each step. 24 = 6 fixed
+# tower slots (always present) + ~18 budget for troops (peak-chaos
+# battles top out around 12 units). Empty slots are zero-padded.
+NUM_DETECTION_SLOTS: int = 24
+# Side encoding for the detection tensor.
+SIDE_FRIENDLY: int = 0
+SIDE_ENEMY: int = 1
+SIDE_TOWER: int = 2
+SIDE_EMPTY: int = 3
+NUM_SIDES: int = 4
+
+# Fixed tower positions (x, y) in the 419x633 frame. Top three are the
+# opponent's towers (low y), bottom three are the agent's. Used to
+# synthesize SIDE_TOWER detections in every observation regardless of
+# what the troop-detection model emits — the new clash-royale-bhjq1/2
+# model classifies troops only and never returns tower bboxes, so the
+# policy would otherwise lose access to "where are the towers". These
+# positions match TOWER_HP_COORDS in rl/reward.py.
+TOWER_POSITIONS: tuple[tuple[int, int, int], ...] = (
+    # (x, y, side)
+    (104, 484, SIDE_FRIENDLY),  # self left princess
+    (210, 543, SIDE_FRIENDLY),  # self king
+    (313, 484, SIDE_FRIENDLY),  # self right princess
+    (104, 112, SIDE_ENEMY),     # opp left princess
+    (210, 56, SIDE_ENEMY),      # opp king
+    (313, 112, SIDE_ENEMY),     # opp right princess
+)
+# Tower entries always carry SIDE_TOWER. Side encoding above is per-detection;
+# for towers the *side* dimension marks "this is a tower", and a separate
+# friendly/enemy distinction comes from the y coord. The policy has both.
+
+# HSV bounds for HP-bar color sampling. Mirror the constants in
+# rl/reward.py so a single set of HSV values governs all team-classifier
+# logic. Duplicated rather than imported to avoid circular imports.
+_HP_ENEMY_RED_LOWER_A = (0, 150, 150)
+_HP_ENEMY_RED_UPPER_A = (10, 255, 255)
+_HP_ENEMY_RED_LOWER_B = (170, 150, 150)
+_HP_ENEMY_RED_UPPER_B = (179, 255, 255)
+_HP_FRIENDLY_BLUE_LOWER = (95, 120, 140)
+_HP_FRIENDLY_BLUE_UPPER = (130, 255, 255)
+# A unit's HP bar is ~25 px wide and ~3 px tall, sitting just above the
+# bbox top. We need at least this many matching pixels to call it.
+_HP_BAR_MIN_PIXELS = 5
+
+
+def _classify_team_from_hp_bar(
+    det: "TroopDetection", frame: np.ndarray
+) -> Side | None:
+    """Sample the HP bar above a detection's bbox; return team or None.
+
+    Returns None when no clear HP bar color is detected (e.g. unit just
+    spawned and its bar isn't drawn yet). Caller should fall back to
+    y-position classification.
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return None
+    h, w = frame.shape[:2]
+    cx = int(det.x)
+    cy_top = int(det.y - det.height / 2)
+    x0 = max(0, cx - 13)
+    x1 = min(w, cx + 14)
+    y0 = max(0, cy_top - 6)
+    y1 = min(h, cy_top + 1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    strip = frame[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+    enemy_mask = cv2.bitwise_or(
+        cv2.inRange(
+            hsv,
+            np.array(_HP_ENEMY_RED_LOWER_A, dtype=np.uint8),
+            np.array(_HP_ENEMY_RED_UPPER_A, dtype=np.uint8),
+        ),
+        cv2.inRange(
+            hsv,
+            np.array(_HP_ENEMY_RED_LOWER_B, dtype=np.uint8),
+            np.array(_HP_ENEMY_RED_UPPER_B, dtype=np.uint8),
+        ),
+    )
+    friendly_mask = cv2.inRange(
+        hsv,
+        np.array(_HP_FRIENDLY_BLUE_LOWER, dtype=np.uint8),
+        np.array(_HP_FRIENDLY_BLUE_UPPER, dtype=np.uint8),
+    )
+    n_enemy = int(np.count_nonzero(enemy_mask))
+    n_friendly = int(np.count_nonzero(friendly_mask))
+    if n_enemy < _HP_BAR_MIN_PIXELS and n_friendly < _HP_BAR_MIN_PIXELS:
+        return None
+    return "enemy" if n_enemy > n_friendly else "friendly"
+
+
+def classify_detection_with_frame(
+    det: "TroopDetection", frame: np.ndarray | None
+) -> Side:
+    """Classify a detection's team, prefering HP-bar color over y-position.
+
+    Decision order:
+      1. Tower keywords in class name -> "tower" (defensive — old model).
+      2. Frame available + readable HP bar -> color-derived team.
+      3. Existing keyword + y-fallback in classify_detection().
+
+    HP-bar sampling is robust during the moment that matters most:
+    when a troop crosses the river, its HP bar persists, while the
+    y-position fallback flips it to the wrong team for several seconds.
+    """
+    name = det.cls.lower()
+    for kw in _TOWER_KEYWORDS:
+        if kw in name:
+            return "tower"
+    if frame is not None:
+        hp_side = _classify_team_from_hp_bar(det, frame)
+        if hp_side is not None:
+            return hp_side
+    return classify_detection(det)
+
+
+def encode_detections(
+    detections: list["TroopDetection"] | None,
+    frame: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pack detections + synthesized towers into fixed-size obs arrays.
+
+    Args:
+        detections: model output for the current frame.
+        frame: BGR screenshot, optional. When provided, troop team
+            classification uses HP-bar color sampling for accuracy
+            (especially across the river); otherwise falls back to
+            y-position via classify_detection().
+
+    Returns:
+        det_class:  (NUM_DETECTION_SLOTS,) int32  — card-vocab id, 0=tower/empty
+        det_pos:    (NUM_DETECTION_SLOTS, 2) float32  — (x_norm, y_norm)
+        det_side:   (NUM_DETECTION_SLOTS,) uint8 — SIDE_* enum
+        det_conf:   (NUM_DETECTION_SLOTS,) float32 — [0, 1] confidence
+
+    Layout: the first 6 slots are always-present synthesized tower
+    entries (SIDE_TOWER, conf=1.0, class_id=0). Remaining slots are
+    filled with troop detections sorted by descending confidence.
+    Empty slots are zero-padded with SIDE_EMPTY.
+    """
+    K = NUM_DETECTION_SLOTS
+    det_class = np.zeros((K,), dtype=np.int32)
+    det_pos = np.zeros((K, 2), dtype=np.float32)
+    det_side = np.full((K,), SIDE_EMPTY, dtype=np.uint8)
+    det_conf = np.zeros((K,), dtype=np.float32)
+
+    # 1. Synthesize fixed tower slots first (always present).
+    n_towers = len(TOWER_POSITIONS)
+    for i, (tx, ty, _team_side) in enumerate(TOWER_POSITIONS):
+        if i >= K:
+            break
+        det_class[i] = 0  # UNKNOWN class — towers are identified by side
+        det_pos[i, 0] = tx / SCREEN_W
+        det_pos[i, 1] = ty / SCREEN_H
+        det_side[i] = SIDE_TOWER
+        det_conf[i] = 1.0
+
+    # 2. Fill remaining slots with troop detections, conf-sorted.
+    remaining = K - n_towers
+    if remaining <= 0 or not detections:
+        return det_class, det_pos, det_side, det_conf
+
+    ranked = sorted(detections, key=lambda d: d.confidence, reverse=True)[:remaining]
+    for j, det in enumerate(ranked):
+        i = n_towers + j
+        side = classify_detection_with_frame(det, frame)
+        if side == "friendly":
+            det_side[i] = SIDE_FRIENDLY
+        elif side == "enemy":
+            det_side[i] = SIDE_ENEMY
+        elif side == "tower":
+            # Rare: model emitted a tower-like name; treat as a tower
+            # but don't double-count (the synthesized slots already
+            # cover known tower positions).
+            det_side[i] = SIDE_TOWER
+        else:
+            det_side[i] = SIDE_EMPTY
+        det_class[i] = troop_class_to_id(det.cls)
+        det_pos[i, 0] = float(det.x) / SCREEN_W
+        det_pos[i, 1] = float(det.y) / SCREEN_H
+        det_conf[i] = float(det.confidence)
+    return det_class, det_pos, det_side, det_conf
 
 
 def read_hand(frame: np.ndarray) -> tuple[list[int], list[bool]]:
@@ -400,7 +654,7 @@ DEFAULT_ROBOFLOW_API_URL = "http://localhost:9001"
 #   1. Open the model page in a browser.
 #   2. Click "Deploy" (top right) -> Python tab.
 #   3. The "Copy Model ID" button gives you exactly "<slug>/<version>".
-DEFAULT_TROOP_MODEL_ID = "clash-royale-xy2jw/2"
+DEFAULT_TROOP_MODEL_ID = "clash-royale-bhjq1/2"
 
 _ROBOFLOW_CLIENT: Any = None
 

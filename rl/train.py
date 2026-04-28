@@ -39,6 +39,7 @@ from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
 from rl.env import ClashRoyaleEnv
+from rl.policy import CardAwareExtractor
 
 CHECKPOINT_DIR = Path("./checkpoints")
 LOG_DIR = Path("./runs")
@@ -138,9 +139,13 @@ def main() -> None:
     else:
         print("[rl.train] Starting fresh PPO run")
         model = PPO(
-            # MultiInputPolicy handles Dict observation spaces: NatureCNN
-            # for the "pixels" key, separate MLP branches for "hand",
-            # "hand_affordable", "elixir", then concatenates.
+            # MultiInputPolicy + CardAwareExtractor handles the Dict
+            # observation: NatureCNN for "pixels"/"troops", a shared
+            # nn.Embedding(NUM_CARD_IDS, 16) for the "hand" card ids
+            # AND the "det_class" troop ids (so a Knight in hand and a
+            # Knight on the board map to the same vector), and a tiny
+            # per-detection MLP that mean+max-pools the K detections
+            # weighted by confidence. See rl/policy.py for details.
             "MultiInputPolicy",
             env,
             learning_rate=2.5e-4,
@@ -152,6 +157,7 @@ def main() -> None:
             # phase when the agent hasn't yet learned which card plays
             # are actually legal / useful. Default is 0.0.
             ent_coef=0.01,
+            policy_kwargs={"features_extractor_class": CardAwareExtractor},
             verbose=1,
             tensorboard_log=str(LOG_DIR),
         )

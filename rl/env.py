@@ -48,6 +48,8 @@ from rl.action_map import CARD_SLOTS, TOTAL_ACTIONS, decode
 from rl.bridge import (
     DEFAULT_MODE,
     NUM_CARD_IDS,
+    NUM_DETECTION_SLOTS,
+    NUM_SIDES,
     SCREEN_H,
     SCREEN_W,
     TROOPS_HEATMAP_SHAPE,
@@ -55,6 +57,7 @@ from rl.bridge import (
     TroopDetection,
     click,
     detect_troops,
+    encode_detections,
     get_emulator,
     get_screen,
     is_in_battle,
@@ -125,6 +128,33 @@ class ClashRoyaleEnv(gym.Env):
                 ),
                 "elixir": spaces.Box(
                     low=0, high=10, shape=(1,), dtype=np.uint8
+                ),
+                # Per-detection structured channel: top-K troop/tower
+                # detections, each with class id, normalized position,
+                # side, and confidence. The custom feature extractor
+                # in rl.policy embeds det_class through the same card
+                # vocabulary as `hand`, so a Knight on the board and a
+                # Knight in hand share representation.
+                "det_class": spaces.Box(
+                    low=0,
+                    high=NUM_CARD_IDS - 1,
+                    shape=(NUM_DETECTION_SLOTS,),
+                    dtype=np.int32,
+                ),
+                "det_pos": spaces.Box(
+                    low=0.0, high=1.0,
+                    shape=(NUM_DETECTION_SLOTS, 2),
+                    dtype=np.float32,
+                ),
+                "det_side": spaces.Box(
+                    low=0, high=NUM_SIDES - 1,
+                    shape=(NUM_DETECTION_SLOTS,),
+                    dtype=np.uint8,
+                ),
+                "det_conf": spaces.Box(
+                    low=0.0, high=1.0,
+                    shape=(NUM_DETECTION_SLOTS,),
+                    dtype=np.float32,
                 ),
             }
         )
@@ -272,6 +302,13 @@ class ClashRoyaleEnv(gym.Env):
         except Exception:
             elixir = 0
 
+        # Pass frame so encode_detections can sample HP bars for
+        # team classification — far more reliable than y-fallback when
+        # troops cross the river.
+        det_class, det_pos, det_side, det_conf = encode_detections(
+            detections, frame=frame
+        )
+
         return {
             "pixels": pixels,
             "troops": troops,
@@ -280,6 +317,10 @@ class ClashRoyaleEnv(gym.Env):
                 [int(a) for a in affordable], dtype=np.uint8
             ),
             "elixir": np.asarray([elixir], dtype=np.uint8),
+            "det_class": det_class,
+            "det_pos": det_pos,
+            "det_side": det_side,
+            "det_conf": det_conf,
         }
 
     @staticmethod
