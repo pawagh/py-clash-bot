@@ -30,13 +30,22 @@ CARD_SLOTS: list[tuple[int, int]] = [
     (341, 563),
 ]
 
-# Agent's half of the arena in pixel space. x spans roughly the full board
-# width (minus UI margins); y spans from just below the river down to just
-# above the card tray.
+# Full playable arena in pixel space. x spans the board minus UI margins;
+# y spans from just past the opp king tower down to just above the card
+# tray, covering BOTH halves of the arena.
+#
+# Placements in the enemy half (y < ~300) are normally rejected by the
+# game, costing the agent a click without spending elixir — that's what
+# INVALID_PLAY_PENALTY in reward.py is for. Once an opp princess tower
+# is destroyed, the enemy half of THAT lane becomes legal, and the
+# LANE_OPENED_BONUS in reward.py rewards placements there. The action
+# space stays fixed (4 cards x 10 x 10 grid + no-op = 401) so loading
+# an existing PPO model still works; the per-cell pixel mapping just
+# covers more of the board.
 ARENA: dict[str, int] = {
     "x_min": 30,
     "x_max": 389,
-    "y_min": 320,
+    "y_min": 80,
     "y_max": 520,
 }
 

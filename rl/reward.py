@@ -61,11 +61,31 @@ class StepInfo:
         no_op: True if the action decoded to the no-op slot.
         play_x: pixel x of the placement (only meaningful when
             card_played=True). Used for lane defense detection.
+        play_y: pixel y of the placement. Used for lane-opened bonus
+            (was the play in the enemy half of an opened lane?) and
+            for radius-based counter-push attribution.
     """
 
     card_played: bool = False
     no_op: bool = False
     play_x: int = -1
+    play_y: int = -1
+
+
+@dataclass
+class _PendingPlay:
+    """A card-play whose downstream effect we resolve a few steps later.
+
+    Used by the counter-push / negative-trade / wasted-spell shaping:
+    we record the enemy detection count within a radius around the
+    placement at play-time, and on resolution compare against the
+    current count to attribute kills (or lack thereof) to the play.
+    """
+
+    step: int
+    x: int
+    y: int
+    enemies_in_radius: int
 
 
 class RewardCalculator:
@@ -113,6 +133,41 @@ class RewardCalculator:
     # enemy troop on the agent's side. Higher than LANE_DEFENSE_BONUS
     # because detections are far more reliable than red-HP-bar HSV.
     TROOP_LANE_DEFENSE_BONUS: ClassVar[float] = 0.05
+
+    # Counter-push / negative-trade / wasted-spell shaping.
+    # On each play we record enemy detections within PLAY_RADIUS_PX of
+    # the placement; PLAY_RESOLVE_WINDOW steps later we re-count and:
+    #   * killed enemies in radius      -> +COUNTER_PUSH_BONUS_PER_KILL
+    #   * play near enemies, none died  -> NEGATIVE_TRADE_PENALTY
+    #   * play in empty area (spell?)   -> WASTED_SPELL_PENALTY
+    # This handles arrows/fireball misuse without needing to know which
+    # slot is a spell — playing any card in an empty area earns a small
+    # penalty proportional to the elixir wasted.
+    PLAY_RESOLVE_WINDOW: ClassVar[int] = 3  # steps; ~1.8s at FRAME_SKIP_SECONDS=0.6
+    PLAY_RADIUS_PX: ClassVar[int] = 100
+    COUNTER_PUSH_BONUS_PER_KILL: ClassVar[float] = 0.10
+    NEGATIVE_TRADE_PENALTY: ClassVar[float] = -0.05
+    WASTED_SPELL_PENALTY: ClassVar[float] = -0.04
+
+    # Lane-opened bonus: once an opp princess tower is destroyed, the
+    # agent can place troops on the enemy half of that lane. This is
+    # a high-leverage action, so reward it explicitly — relying solely
+    # on the eventual tower-HP / crown reward leaves too thin a
+    # gradient for the policy to discover the behavior.
+    LANE_OPENED_BONUS: ClassVar[float] = 0.20
+    # Tower-HP threshold below which we consider a tower "destroyed"
+    # for the lane-opened check. The HP reader can read 0.0-0.05 due
+    # to debris animations on the destroyed-tower frame.
+    LANE_OPENED_HP_THRESHOLD: ClassVar[float] = 0.05
+
+    # Hasty-play penalty. Discourages spending elixir at low-elixir,
+    # low-pressure moments — i.e. the agent should learn to bank
+    # elixir for either an incoming defensive engagement or an empty-
+    # lane initiation push, instead of dumping cards the moment they
+    # become affordable. Only fires when there is neither an enemy on
+    # the agent's half nor a friendly unit already pushing.
+    HASTY_PLAY_PENALTY: ClassVar[float] = -0.04
+    HASTY_PLAY_ELIXIR_THRESHOLD: ClassVar[int] = 5
 
     # Time-structured shaping
     URGENCY_COEF: ClassVar[float] = -0.002
@@ -212,8 +267,11 @@ class RewardCalculator:
         self.prev_tower_hps_opp: tuple[float, float, float] = (1.0, 1.0, 1.0)
         self.prev_unit_diff: int = 0
         self.prev_troop_count_diff: int = 0
+        self.prev_friendly_count: int = 0
         self._was_in_battle = False
         self._battle_start_time: float | None = None
+        self._step_idx: int = 0
+        self._pending_plays: list[_PendingPlay] = []
 
     def reset(self) -> None:
         self.prev_my_crowns = 0
@@ -223,8 +281,11 @@ class RewardCalculator:
         self.prev_tower_hps_opp = (1.0, 1.0, 1.0)
         self.prev_unit_diff = 0
         self.prev_troop_count_diff = 0
+        self.prev_friendly_count = 0
         self._was_in_battle = False
         self._battle_start_time = None
+        self._step_idx = 0
+        self._pending_plays = []
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -258,12 +319,17 @@ class RewardCalculator:
         if currently_in_battle and self._battle_start_time is None:
             self._battle_start_time = time.monotonic()
 
+        self._step_idx += 1
         overtime = self._is_overtime()
         step_scale = self.OVERTIME_STEP_COST_SCALE if overtime else 1.0
         reward = self.STEP_COST * step_scale
 
         if info.no_op:
             reward += self.NOOP_COST
+
+        # Snapshot current elixir for hasty-play check (before _score_elixir
+        # mutates self.prev_elixir).
+        current_elixir = self._read_elixir(frame) if frame is not None else self.prev_elixir
 
         reward += self._score_elixir(frame, info)
         reward += self._score_crowns(frame)
@@ -274,9 +340,18 @@ class RewardCalculator:
             # available — replace, don't stack.
             reward += self._score_troop_count_diff(detections)
             reward += self._score_troop_lane_defense(detections, info)
+            # Counter-push / negative-trade / wasted-spell shaping
+            # needs detections to attribute kills to placements.
+            reward += self._resolve_pending_plays(detections)
+            self._register_play_if_any(info, detections)
+            reward += self._score_hasty_play(detections, info, current_elixir)
         else:
             reward += self._score_unit_differential(frame)
             reward += self._score_lane_defense(frame, info)
+
+        # Lane-opened bonus uses tower-HP state only (no detections needed),
+        # so it runs in both detection and no-detection paths.
+        reward += self._score_lane_opened(info)
 
         reward += self._score_urgency()
 
@@ -411,6 +486,142 @@ class RewardCalculator:
         if not played_left and threat_right:
             return self.TROOP_LANE_DEFENSE_BONUS
         return 0.0
+
+    def _enemies_in_radius(
+        self,
+        detections: list[TroopDetection],
+        x: int,
+        y: int,
+        radius: int,
+    ) -> int:
+        """Count enemy detections within `radius` of (x, y)."""
+        if x < 0 or y < 0:
+            return 0
+        n = 0
+        r2 = radius * radius
+        for det in detections:
+            if classify_detection(det) != "enemy":
+                continue
+            dx = det.x - x
+            dy = det.y - y
+            if dx * dx + dy * dy <= r2:
+                n += 1
+        return n
+
+    def _register_play_if_any(
+        self,
+        info: StepInfo,
+        detections: list[TroopDetection],
+    ) -> None:
+        """Record a fresh play for delayed counter-push attribution."""
+        if not info.card_played or info.play_x < 0 or info.play_y < 0:
+            return
+        enemies = self._enemies_in_radius(
+            detections, info.play_x, info.play_y, self.PLAY_RADIUS_PX
+        )
+        self._pending_plays.append(
+            _PendingPlay(
+                step=self._step_idx,
+                x=info.play_x,
+                y=info.play_y,
+                enemies_in_radius=enemies,
+            )
+        )
+
+    def _resolve_pending_plays(
+        self,
+        detections: list[TroopDetection],
+    ) -> float:
+        """Resolve plays whose effect window has elapsed.
+
+        For each play that's now PLAY_RESOLVE_WINDOW steps old:
+          * killed enemies in radius   -> +COUNTER_PUSH_BONUS_PER_KILL * killed
+          * enemies were nearby, none died -> NEGATIVE_TRADE_PENALTY
+          * no enemies were ever nearby   -> WASTED_SPELL_PENALTY
+        """
+        reward = 0.0
+        survivors: list[_PendingPlay] = []
+        for p in self._pending_plays:
+            age = self._step_idx - p.step
+            if age < self.PLAY_RESOLVE_WINDOW:
+                survivors.append(p)
+                continue
+
+            curr = self._enemies_in_radius(
+                detections, p.x, p.y, self.PLAY_RADIUS_PX
+            )
+            killed = p.enemies_in_radius - curr
+            if killed > 0:
+                reward += self.COUNTER_PUSH_BONUS_PER_KILL * killed
+            elif p.enemies_in_radius > 0:
+                # Engaged enemies but failed to kill any — bad trade.
+                reward += self.NEGATIVE_TRADE_PENALTY
+            else:
+                # Played in an empty area. If it was a spell (arrows /
+                # fireball), this caught nothing. If it was a troop,
+                # it's just a deployment — but spending elixir on a
+                # placement that touches nothing is wasteful enough
+                # for a small penalty.
+                reward += self.WASTED_SPELL_PENALTY
+        self._pending_plays = survivors
+        return reward
+
+    def _score_lane_opened(self, info: StepInfo) -> float:
+        """Bonus for placing on the enemy half of a lane whose princess is dead.
+
+        Uses self.prev_tower_hps_opp which was just updated by
+        _score_tower_hp this step. Index layout:
+          [0] left princess, [1] king, [2] right princess.
+        """
+        if not info.card_played or info.play_x < 0 or info.play_y < 0:
+            return 0.0
+        # Only enemy half placements qualify.
+        if info.play_y >= ARENA_MIDLINE_Y:
+            return 0.0
+        threshold = self.LANE_OPENED_HP_THRESHOLD
+        played_left = info.play_x < self.LANE_SPLIT_X
+        if played_left and self.prev_tower_hps_opp[0] <= threshold:
+            return self.LANE_OPENED_BONUS
+        if not played_left and self.prev_tower_hps_opp[2] <= threshold:
+            return self.LANE_OPENED_BONUS
+        return 0.0
+
+    def _score_hasty_play(
+        self,
+        detections: list[TroopDetection],
+        info: StepInfo,
+        elixir: int,
+    ) -> float:
+        """Penalize low-elixir plays with no defensive or offensive context.
+
+        Fires only when *all* of:
+          * a card was played,
+          * elixir at play time was below HASTY_PLAY_ELIXIR_THRESHOLD,
+          * no enemy detections on the agent's half (no defense needed),
+          * no friendly detections on the enemy half (no push to support).
+
+        Encourages banking elixir for either an incoming engagement or a
+        committed push, instead of the current "spend the moment it's
+        affordable" behavior.
+        """
+        if not info.card_played:
+            return 0.0
+        if elixir >= self.HASTY_PLAY_ELIXIR_THRESHOLD:
+            return 0.0
+
+        any_enemy_threat = False
+        any_friendly_pushing = False
+        for det in detections:
+            side = classify_detection(det)
+            if side == "enemy" and det.y >= ARENA_MIDLINE_Y:
+                any_enemy_threat = True
+            elif side == "friendly" and det.y < ARENA_MIDLINE_Y:
+                any_friendly_pushing = True
+            if any_enemy_threat and any_friendly_pushing:
+                break
+        if any_enemy_threat or any_friendly_pushing:
+            return 0.0
+        return self.HASTY_PLAY_PENALTY
 
     def _score_unit_differential(self, frame: np.ndarray | None) -> float:
         """Dense shaping on friendly-vs-enemy unit mass on the board.

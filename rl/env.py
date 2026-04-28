@@ -141,6 +141,7 @@ class ClashRoyaleEnv(gym.Env):
             click(decoded.x, decoded.y)
             step_info.card_played = True
             step_info.play_x = decoded.x
+            step_info.play_y = decoded.y
 
         interruptible_sleep(FRAME_SKIP_SECONDS)
 
