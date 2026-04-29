@@ -111,8 +111,19 @@ def main() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     if not args.no_check:
+        import warnings
         sanity_env = ClashRoyaleEnv()
-        check_env(sanity_env, warn=True, skip_render_check=True)
+        # SB3's env_checker warns about any non-image Box that isn't 1D.
+        # `det_pos` is shape (16, 2) on purpose — K detections x (x, y) —
+        # and CardAwareExtractor handles the 2D layout natively. The
+        # warning is wrong for our setup, so suppress just it.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*observation det_pos has an unconventional shape.*",
+                category=UserWarning,
+            )
+            check_env(sanity_env, warn=True, skip_render_check=True)
 
     env = build_env()
 
