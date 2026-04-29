@@ -715,8 +715,39 @@ def get_roboflow_client() -> Any:
         )
 
     api_url = os.environ.get("ROBOFLOW_API_URL", DEFAULT_ROBOFLOW_API_URL)
+    api_url = _sanitize_api_url(api_url)
     _ROBOFLOW_CLIENT = InferenceHTTPClient(api_url=api_url, api_key=api_key)
     return _ROBOFLOW_CLIENT
+
+
+def _sanitize_api_url(raw: str) -> str:
+    """Strip whitespace + fragment + query from a user-provided base URL.
+
+    Pasting the inference server URL from a Roboflow dashboard tab can
+    drop a fragment like '#/model/registry?api_key=...' on the end. The
+    inference SDK then concatenates path segments to it, producing a
+    URL that 'requests' rejects as invalid. This guard accepts only the
+    scheme://host[:port] portion.
+    """
+    cleaned = (raw or "").strip()
+    # Drop fragment (#...) and query (?...) — the SDK builds those itself.
+    for sep in ("#", "?"):
+        idx = cleaned.find(sep)
+        if idx >= 0:
+            cleaned = cleaned[:idx].rstrip()
+    # Drop a trailing slash so the SDK can append paths cleanly.
+    cleaned = cleaned.rstrip("/")
+    if not cleaned:
+        return DEFAULT_ROBOFLOW_API_URL
+    if " " in cleaned or "\t" in cleaned:
+        # Unrecoverable — embedded whitespace inside the host portion.
+        # Fall back to the default rather than failing later inside the SDK.
+        print(
+            f"[bridge] ROBOFLOW_API_URL contains whitespace ({raw!r}); "
+            f"falling back to {DEFAULT_ROBOFLOW_API_URL}"
+        )
+        return DEFAULT_ROBOFLOW_API_URL
+    return cleaned
 
 
 def _extract_predictions(result: Any) -> list[dict[str, Any]]:
