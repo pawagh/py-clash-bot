@@ -39,7 +39,6 @@ from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
 from rl.env import ClashRoyaleEnv
-from rl.policy import CardAwareExtractor
 
 CHECKPOINT_DIR = Path("./checkpoints")
 LOG_DIR = Path("./runs")
@@ -111,19 +110,8 @@ def main() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     if not args.no_check:
-        import warnings
         sanity_env = ClashRoyaleEnv()
-        # SB3's env_checker warns about any non-image Box that isn't 1D.
-        # `det_pos` is shape (16, 2) on purpose — K detections x (x, y) —
-        # and CardAwareExtractor handles the 2D layout natively. The
-        # warning is wrong for our setup, so suppress just it.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r".*observation det_pos has an unconventional shape.*",
-                category=UserWarning,
-            )
-            check_env(sanity_env, warn=True, skip_render_check=True)
+        check_env(sanity_env, warn=True, skip_render_check=True)
 
     env = build_env()
 
@@ -150,13 +138,11 @@ def main() -> None:
     else:
         print("[rl.train] Starting fresh PPO run")
         model = PPO(
-            # MultiInputPolicy + CardAwareExtractor handles the Dict
-            # observation: NatureCNN for "pixels"/"troops", a shared
-            # nn.Embedding(NUM_CARD_IDS, 16) for the "hand" card ids
-            # AND the "det_class" troop ids (so a Knight in hand and a
-            # Knight on the board map to the same vector), and a tiny
-            # per-detection MLP that mean+max-pools the K detections
-            # weighted by confidence. See rl/policy.py for details.
+            # MultiInputPolicy handles Dict observation spaces: NatureCNN
+            # for the "pixels"/"troops" image keys, separate Flatten
+            # branches for "hand", "hand_affordable", "elixir", then
+            # concatenates. Default CombinedExtractor — small enough to
+            # learn quickly under tight step budgets.
             "MultiInputPolicy",
             env,
             learning_rate=2.5e-4,
@@ -168,7 +154,6 @@ def main() -> None:
             # phase when the agent hasn't yet learned which card plays
             # are actually legal / useful. Default is 0.0.
             ent_coef=0.01,
-            policy_kwargs={"features_extractor_class": CardAwareExtractor},
             verbose=1,
             tensorboard_log=str(LOG_DIR),
         )

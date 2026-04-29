@@ -385,37 +385,54 @@ TOWER_POSITIONS: tuple[tuple[int, int, int], ...] = (
 # for towers the *side* dimension marks "this is a tower", and a separate
 # friendly/enemy distinction comes from the y coord. The policy has both.
 
-# HSV bounds for HP-bar color sampling. Mirror the constants in
-# rl/reward.py so a single set of HSV values governs all team-classifier
-# logic. Duplicated rather than imported to avoid circular imports.
-_HP_ENEMY_RED_LOWER_A = (0, 150, 150)
-_HP_ENEMY_RED_UPPER_A = (10, 255, 255)
-_HP_ENEMY_RED_LOWER_B = (170, 150, 150)
-_HP_ENEMY_RED_UPPER_B = (179, 255, 255)
-_HP_FRIENDLY_BLUE_LOWER = (95, 120, 140)
-_HP_FRIENDLY_BLUE_UPPER = (130, 255, 255)
-# A unit's HP bar is ~25 px wide and ~3 px tall, sitting just above the
-# bbox top. We need at least this many matching pixels to call it.
-_HP_BAR_MIN_PIXELS = 5
+# HSV bounds for team-color sampling above the troop bbox.
+#
+# Two visual signals coexist there: (1) the level-indicator badge — a
+# small red (enemy) or blue (friendly) tile with a white level number,
+# always visible regardless of HP; (2) the HP bar — a thin colored
+# strip that only appears once the unit takes damage. We sample a tall
+# region covering both.
+#
+# Bounds are deliberately looser than reward.py's HP-only constants
+# because anti-aliased badge edges and the level-number digits push
+# saturation/value lower than full-bright HP-bar pixels.
+_TEAM_ENEMY_RED_LOWER_A = (0, 100, 100)
+_TEAM_ENEMY_RED_UPPER_A = (12, 255, 255)
+_TEAM_ENEMY_RED_LOWER_B = (165, 100, 100)
+_TEAM_ENEMY_RED_UPPER_B = (179, 255, 255)
+_TEAM_FRIENDLY_BLUE_LOWER = (90, 90, 100)
+_TEAM_FRIENDLY_BLUE_UPPER = (135, 255, 255)
+# Sampling region geometry above the bbox top. Captures both the level
+# badge (~10x6 px, ~12 px above bbox top) and the HP bar (~25x3 px just
+# above bbox top) in a single rectangle.
+_TEAM_SAMPLE_HEIGHT = 18  # px above bbox top
+_TEAM_SAMPLE_HALF_WIDTH = 16
+# Lower threshold than the HP-only version: the level badge alone is
+# only ~6 high-saturation pixels of pure red/blue at 419x633 zoom,
+# and we must classify even when the HP bar is invisible.
+_TEAM_MIN_PIXELS = 3
 
 
-def _classify_team_from_hp_bar(
+def _classify_team_from_indicator(
     det: "TroopDetection", frame: np.ndarray
 ) -> Side | None:
-    """Sample the HP bar above a detection's bbox; return team or None.
+    """Sample the level-badge + HP-bar region above the troop's bbox.
 
-    Returns None when no clear HP bar color is detected (e.g. unit just
-    spawned and its bar isn't drawn yet). Caller should fall back to
-    y-position classification.
+    Returns "enemy" / "friendly" when one team color clearly dominates,
+    or None when both are below threshold (caller falls back to y).
+
+    The level badge (always visible) is a far stronger signal than the
+    HP bar (only visible after damage), so this works on freshly-spawned
+    full-HP troops where the previous HP-only classifier returned None.
     """
     if frame is None or getattr(frame, "size", 0) == 0:
         return None
     h, w = frame.shape[:2]
     cx = int(det.x)
     cy_top = int(det.y - det.height / 2)
-    x0 = max(0, cx - 13)
-    x1 = min(w, cx + 14)
-    y0 = max(0, cy_top - 6)
+    x0 = max(0, cx - _TEAM_SAMPLE_HALF_WIDTH)
+    x1 = min(w, cx + _TEAM_SAMPLE_HALF_WIDTH + 1)
+    y0 = max(0, cy_top - _TEAM_SAMPLE_HEIGHT)
     y1 = min(h, cy_top + 1)
     if x1 <= x0 or y1 <= y0:
         return None
@@ -425,49 +442,62 @@ def _classify_team_from_hp_bar(
     enemy_mask = cv2.bitwise_or(
         cv2.inRange(
             hsv,
-            np.array(_HP_ENEMY_RED_LOWER_A, dtype=np.uint8),
-            np.array(_HP_ENEMY_RED_UPPER_A, dtype=np.uint8),
+            np.array(_TEAM_ENEMY_RED_LOWER_A, dtype=np.uint8),
+            np.array(_TEAM_ENEMY_RED_UPPER_A, dtype=np.uint8),
         ),
         cv2.inRange(
             hsv,
-            np.array(_HP_ENEMY_RED_LOWER_B, dtype=np.uint8),
-            np.array(_HP_ENEMY_RED_UPPER_B, dtype=np.uint8),
+            np.array(_TEAM_ENEMY_RED_LOWER_B, dtype=np.uint8),
+            np.array(_TEAM_ENEMY_RED_UPPER_B, dtype=np.uint8),
         ),
     )
     friendly_mask = cv2.inRange(
         hsv,
-        np.array(_HP_FRIENDLY_BLUE_LOWER, dtype=np.uint8),
-        np.array(_HP_FRIENDLY_BLUE_UPPER, dtype=np.uint8),
+        np.array(_TEAM_FRIENDLY_BLUE_LOWER, dtype=np.uint8),
+        np.array(_TEAM_FRIENDLY_BLUE_UPPER, dtype=np.uint8),
     )
     n_enemy = int(np.count_nonzero(enemy_mask))
     n_friendly = int(np.count_nonzero(friendly_mask))
-    if n_enemy < _HP_BAR_MIN_PIXELS and n_friendly < _HP_BAR_MIN_PIXELS:
+    if n_enemy < _TEAM_MIN_PIXELS and n_friendly < _TEAM_MIN_PIXELS:
         return None
-    return "enemy" if n_enemy > n_friendly else "friendly"
+    # Tie-break: if both colors hit, slight asymmetry favors red. Enemy
+    # level badges have a larger red fill area than friendly badges have
+    # blue (friendly badges sit on a lighter blue background that often
+    # clips through HSV bounds at edges).
+    if n_enemy >= n_friendly:
+        return "enemy"
+    return "friendly"
+
+
+# Backwards-compatible alias so any external callers keep working.
+_classify_team_from_hp_bar = _classify_team_from_indicator
 
 
 def classify_detection_with_frame(
     det: "TroopDetection", frame: np.ndarray | None
 ) -> Side:
-    """Classify a detection's team, prefering HP-bar color over y-position.
+    """Classify a detection's team, preferring color sampling over y-fallback.
 
     Decision order:
-      1. Tower keywords in class name -> "tower" (defensive — old model).
-      2. Frame available + readable HP bar -> color-derived team.
+      1. Tower keywords in class name -> "tower".
+      2. Frame available + level-badge / HP-bar dominantly red or blue
+         in the sample region above the bbox -> color-derived team.
       3. Existing keyword + y-fallback in classify_detection().
 
-    HP-bar sampling is robust during the moment that matters most:
-    when a troop crosses the river, its HP bar persists, while the
-    y-position fallback flips it to the wrong team for several seconds.
+    Color sampling reads the *level indicator badge* above each troop
+    (always visible — full-red for enemy, full-blue for friendly) and,
+    if the HP bar is showing, picks that up too. This is robust when
+    troops are full-HP (so no HP bar) and when they cross the river
+    (so y-fallback would flip the team).
     """
     name = det.cls.lower()
     for kw in _TOWER_KEYWORDS:
         if kw in name:
             return "tower"
     if frame is not None:
-        hp_side = _classify_team_from_hp_bar(det, frame)
-        if hp_side is not None:
-            return hp_side
+        team_side = _classify_team_from_indicator(det, frame)
+        if team_side is not None:
+            return team_side
     return classify_detection(det)
 
 
@@ -654,7 +684,7 @@ DEFAULT_ROBOFLOW_API_URL = "http://localhost:9001"
 #   1. Open the model page in a browser.
 #   2. Click "Deploy" (top right) -> Python tab.
 #   3. The "Copy Model ID" button gives you exactly "<slug>/<version>".
-DEFAULT_TROOP_MODEL_ID = "clash-royale-bhjq1/2"
+DEFAULT_TROOP_MODEL_ID = "clash-royale-xy2jw/2"
 
 _ROBOFLOW_CLIENT: Any = None
 
