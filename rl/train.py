@@ -100,6 +100,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the SB3 env sanity check at startup (avoids extra live clicks).",
     )
+    p.add_argument(
+        "--tb-log-name",
+        type=str,
+        default=TB_LOG_NAME,
+        help=(
+            "TensorBoard run name. SB3 creates runs/<name>_<n>/ per call. "
+            "Use a distinct name per experiment (e.g. 'trial3') to keep "
+            "graphs separate; with reset_num_timesteps=False, runs sharing "
+            "a name pile into the same directory and become uninterpretable."
+        ),
+    )
     return p.parse_args()
 
 
@@ -181,7 +192,7 @@ def main() -> None:
         total_timesteps=remaining,
         callback=checkpoint_cb,
         reset_num_timesteps=False,
-        tb_log_name=TB_LOG_NAME,
+        tb_log_name=args.tb_log_name,
     )
     final_path = CHECKPOINT_DIR / f"{CHECKPOINT_PREFIX}_final"
     model.save(str(final_path))
