@@ -1,0 +1,200 @@
+[
+  {
+    "cls": "enemy princess tower",
+    "confidence": 0.9738026261329651,
+    "x": 302.0,
+    "y": 119.5,
+    "width": 52.0,
+    "height": 69.0,
+    "raw": {
+      "x": 302.0,
+      "y": 119.5,
+      "width": 52.0,
+      "height": 69.0,
+      "confidence": 0.9738026261329651,
+      "class": "enemy princess tower",
+      "class_id": 6,
+      "detection_id": "ac635953-5ea7-4728-aa97-9f954020dbb7"
+    }
+  },
+  {
+    "cls": "enemy king tower",
+    "confidence": 0.9660939574241638,
+    "x": 209.5,
+    "y": 75.5,
+    "width": 53.0,
+    "height": 73.0,
+    "raw": {
+      "x": 209.5,
+      "y": 75.5,
+      "width": 53.0,
+      "height": 73.0,
+      "confidence": 0.9660939574241638,
+      "class": "enemy king tower",
+      "class_id": 5,
+      "detection_id": "8a8accbd-2cf6-4938-9609-b90e10a8d057"
+    }
+  },
+  {
+    "cls": "enemy princess tower",
+    "confidence": 0.9603203535079956,
+    "x": 116.0,
+    "y": 119.5,
+    "width": 50.0,
+    "height": 69.0,
+    "raw": {
+      "x": 116.0,
+      "y": 119.5,
+      "width": 50.0,
+      "height": 69.0,
+      "confidence": 0.9603203535079956,
+      "class": "enemy princess tower",
+      "class_id": 6,
+      "detection_id": "13cda883-40d4-4f4a-8abf-ae053ab8f0d8"
+    }
+  },
+  {
+    "cls": "ally princess tower",
+    "confidence": 0.947127640247345,
+    "x": 118.0,
+    "y": 386.5,
+    "width": 48.0,
+    "height": 53.0,
+    "raw": {
+      "x": 118.0,
+      "y": 386.5,
+      "width": 48.0,
+      "height": 53.0,
+      "confidence": 0.947127640247345,
+      "class": "ally princess tower",
+      "class_id": 2,
+      "detection_id": "22248042-b2f2-452a-bcd0-aac3607f26b9"
+    }
+  },
+  {
+    "cls": "ally princess tower",
+    "confidence": 0.9398011565208435,
+    "x": 303.0,
+    "y": 385.5,
+    "width": 52.0,
+    "height": 53.0,
+    "raw": {
+      "x": 303.0,
+      "y": 385.5,
+      "width": 52.0,
+      "height": 53.0,
+      "confidence": 0.9398011565208435,
+      "class": "ally princess tower",
+      "class_id": 2,
+      "detection_id": "687ec24e-a748-4832-bcc1-aaa2075cdd62"
+    }
+  },
+  {
+    "cls": "ally king tower",
+    "confidence": 0.9116562008857727,
+    "x": 209.5,
+    "y": 434.5,
+    "width": 55.0,
+    "height": 63.0,
+    "raw": {
+      "x": 209.5,
+      "y": 434.5,
+      "width": 55.0,
+      "height": 63.0,
+      "confidence": 0.9116562008857727,
+      "class": "ally king tower",
+      "class_id": 1,
+      "detection_id": "7a03c332-9f9f-43cb-80ec-fb786234d514"
+    }
+  },
+  {
+    "cls": "enemy troop",
+    "confidence": 0.9001454710960388,
+    "x": 116.5,
+    "y": 222.0,
+    "width": 21.0,
+    "height": 38.0,
+    "raw": {
+      "x": 116.5,
+      "y": 222.0,
+      "width": 21.0,
+      "height": 38.0,
+      "confidence": 0.9001454710960388,
+      "class": "enemy troop",
+      "class_id": 7,
+      "detection_id": "c4b1d816-e961-43e2-8c43-20d8bea2c072"
+    }
+  },
+  {
+    "cls": "ally troop",
+    "confidence": 0.8142883777618408,
+    "x": 127.0,
+    "y": 262.0,
+    "width": 38.0,
+    "height": 40.0,
+    "raw": {
+      "x": 127.0,
+      "y": 262.0,
+      "width": 38.0,
+      "height": 40.0,
+      "confidence": 0.8142883777618408,
+      "class": "ally troop",
+      "class_id": 3,
+      "detection_id": "73e59158-2cc1-4001-9b79-b45a971aa3f4"
+    }
+  },
+  {
+    "cls": "ally troop",
+    "confidence": 0.7876410484313965,
+    "x": 145.0,
+    "y": 312.0,
+    "width": 18.0,
+    "height": 22.0,
+    "raw": {
+      "x": 145.0,
+      "y": 312.0,
+      "width": 18.0,
+      "height": 22.0,
+      "confidence": 0.7876410484313965,
+      "class": "ally troop",
+      "class_id": 3,
+      "detection_id": "ac950438-c741-4950-b629-ce997b95f138"
+    }
+  },
+  {
+    "cls": "ally building",
+    "confidence": 0.771054208278656,
+    "x": 184.5,
+    "y": 332.0,
+    "width": 37.0,
+    "height": 52.0,
+    "raw": {
+      "x": 184.5,
+      "y": 332.0,
+      "width": 37.0,
+      "height": 52.0,
+      "confidence": 0.771054208278656,
+      "class": "ally building",
+      "class_id": 0,
+      "detection_id": "e87d7c81-50e4-4f17-a4d6-f8f68ea11832"
+    }
+  },
+  {
+    "cls": "ally troop",
+    "confidence": 0.43121016025543213,
+    "x": 124.0,
+    "y": 312.5,
+    "width": 18.0,
+    "height": 23.0,
+    "raw": {
+      "x": 124.0,
+      "y": 312.5,
+      "width": 18.0,
+      "height": 23.0,
+      "confidence": 0.43121016025543213,
+      "class": "ally troop",
+      "class_id": 3,
+      "detection_id": "7b38e373-af1f-4acf-babb-573790f7ac4a"
+    }
+  }
+]
